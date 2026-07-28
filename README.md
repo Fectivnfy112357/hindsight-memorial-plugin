@@ -49,10 +49,10 @@ cloning anything first.
 
 ```bash
 # 1. Register this repo as a marketplace (one-time, per machine)
-/claude plugin marketplace add Fectivnfy112357/hindsight-memorial-plugin
+/plugin marketplace add Fectivnfy112357/hindsight-memorial-plugin
 
 # 2. Install the plugin
-/claude plugin install hindsight-memorial@hindsight-memorial-plugin
+/plugin install hindsight-memorial@hindsight-memorial
 
 # 3. Reload so the new matcher is picked up (or restart Claude Code)
 /reload-plugins
@@ -62,7 +62,7 @@ Verify it loaded:
 
 ```bash
 cat ~/.claude/settings.json | python -c "import sys,json; print(json.load(sys.stdin).get('enabledPlugins'))"
-# should contain: {'hindsight-memorial@hindsight-memorial-plugin': True, ...}
+# should contain: {'hindsight-memorial@hindsight-memorial': True, ...}
 ```
 
 ### Local install (development)
