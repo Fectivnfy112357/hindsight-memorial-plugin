@@ -1,0 +1,18 @@
+{
+  "description": "Hindsight memorial: after each retain tool call, reflect on the bank and curate any superseded facts. Never blocks the agent.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__plugin_hindsight-memory_hindsight__agent_knowledge_ingest",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/retain_reflect_curate.py",
+            "timeout": 180,
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

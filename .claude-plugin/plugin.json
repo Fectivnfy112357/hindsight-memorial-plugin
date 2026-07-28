@@ -1,0 +1,10 @@
+{
+  "name": "hindsight-memorial",
+  "description": "Client-side pollution cleanup for Hindsight memories. After each retain, runs a reflect LLM call against the bank to detect superseded facts, then soft-deletes them and clears their derived observations.",
+  "version": "0.1.0",
+  "author": {
+    "name": "贾晓源"
+  },
+  "license": "MIT",
+  "keywords": ["memory", "hindsight", "cleanup", "pollution", "reflect"]
+}

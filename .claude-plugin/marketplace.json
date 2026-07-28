@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "hindsight-memorial",
+  "version": "0.1.0",
+  "description": "Client-side pollution cleanup for Hindsight memories",
+  "owner": {
+    "name": "贾晓源"
+  },
+  "plugins": [
+    {
+      "name": "hindsight-memorial",
+      "description": "After each retain, reflect on the bank to detect superseded facts, then soft-delete them and clear their derived observations.",
+      "source": "./"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hindsight-memorial"
+version = "0.1.0"
+description = "Client-side pollution cleanup for Hindsight memories across Claude Code / Codex / Hermes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+authors = [{ name = "贾晓源" }]
+keywords = ["hindsight", "memory", "agent", "cleanup", "pollution"]
+
+# NOTE: this project is consumed as a Claude Code plugin (drop the directory into a
+# marketplace or run `claude plugin install`). The Python modules under scripts/lib are
+# imported by scripts/retain_reflect_curate.py at runtime via `sys.path` manipulation
+# (see scripts/retain_reflect_curate.py), NOT as an installed package. So we deliberately
+# omit `[tool.setuptools.packages.find]` and the `[project.scripts]` entry: there is no
+# installable wheel. `pip install` is not required, and `pip install -e .` is a no-op.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

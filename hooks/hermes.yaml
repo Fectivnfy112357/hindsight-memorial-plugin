@@ -1,0 +1,12 @@
+# Hermes shell-hook config: copy this snippet into ~/.hermes/config.yaml under the
+# top-level `hooks:` key. It fires `retain_reflect_curate.py` after every hindsight
+# retain invocation that goes through the terminal tool.
+#
+# Filtering on "is this a hindsight retain?" is done inside retain_reflect_curate.py by
+# inspecting the stdin payload — the matcher is intentionally broad so the script can
+# decide whether the action is relevant.
+hooks:
+  post_tool_call:
+    - matcher: terminal
+      command: "python3 ~/.hindsight-memorial/retain_reflect_curate.py"
+      timeout: 60

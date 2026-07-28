@@ -1,0 +1,17 @@
+{
+  "_comment": "Filter on hindsight retain is done inside retain_reflect_curate.py via stdin payload inspection. The matcher is intentionally broad so the script can decide.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $REPO/.hindsight-memorial/retain_reflect_curate.py",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
