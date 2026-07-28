@@ -49,10 +49,10 @@ cloning anything first.
 
 ```bash
 # 1. Register this repo as a marketplace (one-time, per machine)
-claude plugin marketplace add Fectivnfy112357/hindsight-memorial-plugin
+/claude plugin marketplace add Fectivnfy112357/hindsight-memorial-plugin
 
 # 2. Install the plugin
-claude plugin install hindsight-memorial@hindsight-memorial-plugin
+/claude plugin install hindsight-memorial@hindsight-memorial-plugin
 
 # 3. Reload so the new matcher is picked up (or restart Claude Code)
 /reload-plugins
