@@ -42,24 +42,40 @@ recoverable (`PATCH state=valid` restores it).
 
 ## Install
 
-This project is consumed as a **Claude Code plugin** (drop the directory into a marketplace). The
-easiest path is to install it from the local checkout — point Claude Code at this repo as a
-marketplace:
+This project is distributed as a **Claude Code plugin on GitHub**. Anyone can install it without
+cloning anything first.
+
+**Prerequisite**: Claude Code CLI ≥ 1.0 with plugin support.
 
 ```bash
-# One-time: register the local directory as a marketplace
-claude plugin marketplace add "D:/programming/projects/hindsight-memorial" --scope user
+# 1. Register this repo as a marketplace (one-time, per machine)
+claude plugin marketplace add Fectivnfy112357/hindsight-memorial-plugin
 
-# Install the plugin
-claude plugin install hindsight-memorial@hindsight-memorial --scope user
+# 2. Install the plugin
+claude plugin install hindsight-memorial@hindsight-memorial-plugin
+
+# 3. Reload so the new matcher is picked up (or restart Claude Code)
+/reload-plugins
 ```
 
-Then `/reload-plugins` (or restart Claude Code) so the new matcher is picked up. Verify:
+Verify it loaded:
 
 ```bash
 cat ~/.claude/settings.json | python -c "import sys,json; print(json.load(sys.stdin).get('enabledPlugins'))"
-# should contain: {'hindsight-memorial@hindsight-memorial': True, ...}
+# should contain: {'hindsight-memorial@hindsight-memorial-plugin': True, ...}
 ```
+
+### Local install (development)
+
+If you're hacking on the plugin itself and want Claude Code to pick up your local edits:
+
+```bash
+claude plugin marketplace add "D:/programming/projects/hindsight-memorial" --scope user
+claude plugin install hindsight-memorial@hindsight-memorial --scope user
+/reload-plugins
+```
+
+Then edit files under the project directory and re-run `/reload-plugins` to see changes.
 
 ### Configure
 
