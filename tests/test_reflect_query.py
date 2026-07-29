@@ -4,9 +4,9 @@ from __future__ import annotations
 import sys
 import unittest
 
-sys.path.insert(0, "D:/programming/projects/hindsight-memorial/scripts")
+sys.path.insert(0, "D:/programming/projects/hindsight-memorial")
 
-from lib.reflect_query import extract_superseded_ids
+from hindsight_memorial.reflect_query import extract_superseded_ids
 
 
 UUID_A = "11111111-1111-1111-1111-111111111111"

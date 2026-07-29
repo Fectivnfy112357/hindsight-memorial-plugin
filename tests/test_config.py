@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, "D:/programming/projects/hindsight-memorial/scripts")
+sys.path.insert(0, "D:/programming/projects/hindsight-memorial")
 
-from lib.config import (
+from hindsight_memorial.config import (
     DEFAULT_CONFIG_PATH,
     MemorialConfig,
     _normalise_dir,

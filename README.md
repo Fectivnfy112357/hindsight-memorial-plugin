@@ -37,8 +37,8 @@ recoverable (`PATCH state=valid` restores it).
 | Client       | Status             | Hook file                  | Tool name the hook matches           |
 |--------------|--------------------|----------------------------|---------------------------------------|
 | Claude Code  | **End-to-end verified** | [`hooks/hooks.json`](hooks/hooks.json) | `mcp__plugin_hindsight-memory_hindsight__agent_knowledge_ingest` |
+| Hermes Agent | **Plugin verified** | [`plugin.yaml`](plugin.yaml) | `hindsight_retain` / `agent_knowledge_ingest` (substring match) |
 | Codex CLI    | Template only — not yet tested on a live Codex | [`hooks/codex.json`](hooks/codex.json) | `^hindsight_retain$` (regex; pending real-name confirmation) |
-| Hermes Agent | Template only — not yet tested on a live Hermes | [`hooks/hermes.yaml`](hooks/hermes.yaml) | `^hindsight_retain$` (shell hook; Hermes also supports plugin distribution, not yet packaged) |
 
 ## Install
 
@@ -76,6 +76,43 @@ claude plugin install hindsight-memorial@hindsight-memorial --scope user
 ```
 
 Then edit files under the project directory and re-run `/reload-plugins` to see changes.
+
+### Hermes install
+
+The Hermes integration is a native plugin. Install it once and it fires
+automatically after every `hindsight_retain` call.
+
+**Prerequisite**: Hermes Agent with plugin support.
+
+```bash
+# Install directly from GitHub
+hermes plugins install Fectivnfy112357/hindsight-memorial-plugin --enable
+
+# Restart Hermes (or /reset in-session)
+```
+
+Verify it's loaded:
+
+```bash
+hermes plugins list
+# should show: hindsight-memorial  enabled  (plugin)
+```
+
+**What it does under the hood**: the plugin registers a `post_tool_call` hook
+that matches `hindsight_retain` / `agent_knowledge_ingest` tool names. After
+each retain, it calls Hindsight's reflect endpoint to detect superseded facts,
+then soft-deletes them.
+
+**Config**: the plugin reads API credentials from Hermes' own environment
+(`$HERMES_HOME/.env` → `HINDSIGHT_API_URL` / `HINDSIGHT_API_KEY`) and
+bank id from `$HERMES_HOME/hindsight/config.json`.
+
+### Shell hook (alternative, if you prefer config.yaml)
+
+The old shell-hook approach still works. Copy the relevant block from
+[`hooks/hermes.yaml`](hooks/hermes.yaml) into `~/.hermes/config.yaml` under
+the `hooks:` key. The plugin is recommended — it's self-contained and doesn't
+require editing config.yaml.
 
 ### Configure
 
@@ -123,17 +160,17 @@ have seen:
 python scripts/retain_reflect_curate.py --cwd . --bank-id test --new-fact "..." --dry-run
 ```
 
-### Hook into Codex / Hermes (when you're ready)
+### Hook into Codex (when you're ready)
 
 The hook configs in [`hooks/`](hooks/) are templates. They are **not** wired up automatically;
 they're provided so you can copy the relevant one to the correct location for your client:
 
 - Codex: drop into `~/.codex/hooks.json` (and ensure Codex CLI ≥ v0.124 for stable hook support)
-- Hermes: append the `hooks:` block to `~/.hermes/config.yaml`
+- Hermes: use the plugin (see install section above) — no manual hook config needed
 
 Tool names on those clients are different from Claude Code's MCP name — see the table at the top
-of this README. Verify the exact tool name in your client's tool list before activating, and update
-the `matcher` field accordingly.
+of this README. For Codex, verify the exact tool name in your client's tool list before activating,
+and update the `matcher` field accordingly.
 
 ## Tests
 
@@ -173,12 +210,20 @@ hindsight-memorial/
 ├── .claude-plugin/
 │   ├── plugin.json          ← Claude Code plugin manifest
 │   └── marketplace.json     ← self-host marketplace (so `claude plugin marketplace add <path>` works)
+├── plugin.yaml            ← Hermes plugin manifest (repo root)
+├── __init__.py            ← Hermes plugin entry point (register(ctx) → post_tool_call hook)
+├── hindsight_memorial/      ← shared Python package (imported by both Claude Code and Hermes)
+│   ├── __init__.py
+│   ├── client.py            ← stdlib HTTP client (4 Hindsight endpoints)
+│   ├── config.py            ← config loading (env + ~/.hindsight/*.json)
+│   ├── curate.py            ← soft-delete + observation-clear
+│   └── reflect_query.py     ← structured supersession query
 ├── hooks/
 │   ├── hooks.json           ← ACTIVE: Claude Code PostToolUse hook
 │   ├── codex.json           ← template: Codex CLI hook config
-│   └── hermes.yaml          ← template: Hermes shell-hook config
+│   └── hermes.yaml          ← reference: Hermes shell hook (plugin is preferred)
 ├── scripts/
-│   ├── lib/{client,config,curate,reflect_query}.py
+│   ├── lib/                 ← backward-compat re-exports of hindsight_memorial
 │   └── retain_reflect_curate.py        ← main entry point (run by hooks)
 ├── skills/hindsight-memorial/SKILL.md  ← plugin skill (auto-loaded into Claude Code sessions)
 ├── tests/                              ← 34 unit tests (stdlib only)

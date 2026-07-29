@@ -8,10 +8,10 @@ import unittest
 import urllib.error
 from unittest import mock
 
-sys.path.insert(0, "D:/programming/projects/hindsight-memorial/scripts")
+sys.path.insert(0, "D:/programming/projects/hindsight-memorial")
 
-from lib import client as client_mod
-from lib.client import HindsightAPIError, HindsightClient
+from hindsight_memorial import client as client_mod
+from hindsight_memorial.client import HindsightAPIError, HindsightClient
 
 
 def _http_error(status: int, body: str = "{}"):

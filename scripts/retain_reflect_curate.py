@@ -20,10 +20,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from lib.client import HindsightAPIError, HindsightClient
-from lib.config import load_config
-from lib.curate import curate_many
-from lib.reflect_query import SUPERSEDED_SCHEMA, build_query, extract_superseded_ids
+# The shared library lives one level up from scripts/, at the project root.
+# Add the project root to sys.path so both the Claude Code hook and Hermes
+# plugin can import from the same hindsight_memorial package.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from hindsight_memorial.client import HindsightAPIError, HindsightClient
+from hindsight_memorial.config import load_config
+from hindsight_memorial.curate import curate_many
+from hindsight_memorial.reflect_query import SUPERSEDED_SCHEMA, build_query, extract_superseded_ids
 
 log = logging.getLogger("hindsight_memorial")
 
@@ -115,7 +122,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "no bank_id resolved "
                 f"(config bank_source={cfg.bank_source}; "
                 "set --bank-id or HINDSIGHT_BANK_ID or add bankId/directoryBankMap to "
-                "~/.hindsight/claude-code.json)"
+                "~/.hindsight/claude-code.json or ~/.hindsight/hermes.json)"
             ),
         }
     if not cfg.api_url:
@@ -123,7 +130,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "skipped",
             "reason": (
                 "no api_url configured "
-                "(set HINDSIGHT_API_URL or add hindsightApiUrl to ~/.hindsight/claude-code.json)"
+                "(set HINDSIGHT_API_URL or add hindsightApiUrl to "
+                "~/.hindsight/claude-code.json or ~/.hindsight/hermes.json)"
             ),
         }
 

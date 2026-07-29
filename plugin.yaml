@@ -1,0 +1,9 @@
+name: hindsight-memorial
+version: "0.1.0"
+description: >-
+  Client-side pollution cleanup for Hindsight memories.
+  After every hindsight_retain call, runs a reflect LLM query
+  to detect superseded facts and soft-deletes them.
+author: 贾晓源
+requires_env:
+  - HINDSIGHT_API_URL

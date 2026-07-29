@@ -30,6 +30,7 @@ from typing import Any
 DEFAULT_CONFIG_PATH = Path.home() / ".hindsight" / "claude-code.json"
 DEFAULT_HERMES_CONFIG_PATH = Path.home() / ".hindsight" / "hermes.json"
 
+
 @dataclass(frozen=True)
 class MemorialConfig:
     """Resolved config: API URL/key plus the bank id to operate on.

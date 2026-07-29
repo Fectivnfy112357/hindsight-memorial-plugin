@@ -11,6 +11,7 @@ import unittest
 from contextlib import contextmanager
 from unittest import mock
 
+sys.path.insert(0, "D:/programming/projects/hindsight-memorial")
 sys.path.insert(0, "D:/programming/projects/hindsight-memorial/scripts")
 
 import retain_reflect_curate as rrc
@@ -23,7 +24,7 @@ def _mock_urlopen(responses: list[mock.Mock]):
     We patch `urllib.request.urlopen` in the *lib.client* namespace because that's where it's
     imported, not in retain_reflect_curate itself.
     """
-    from lib import client as client_mod
+    from hindsight_memorial import client as client_mod
 
     calls: list[dict] = []
 
