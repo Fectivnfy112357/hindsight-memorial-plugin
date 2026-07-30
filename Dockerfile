@@ -1,13 +1,12 @@
 # Dockerfile for hindsight-memorial webhook receiver.
 #
 # Stdlib-only Python package — no third-party deps to install. We start from
-# python:3.13-slim and just add the source tree. The image is small (~120 MB)
-# and rebuilds in seconds because pip-install is a no-op.
+# python:3.13-slim and copy the source tree into the image. The image ends up
+# at ~125 MB and rebuilds in seconds because there's no pip-install step.
 #
-# Usage from the parent docker-compose.yml:
-#     build: .
-#     volumes:
-#       - ./app:/app:ro      # mount the source tree read-only for hot reloads
+# After `docker compose up -d --build`, the running container is fully self-
+# contained: it does NOT need the host to have the source tree mounted. Logs
+# are the only host bind-mount, see docker-compose.yml.
 #
 # Environment variables (set via compose `environment:` / `env_file:`):
 #     HINDSIGHT_API_URL             e.g. http://hindsight:8888 (in compose network)
@@ -17,25 +16,24 @@
 #     HINDSIGHT_MEMORIAL_LOG_LEVEL  optional, default INFO
 FROM python:3.13-slim
 
-# No pip install needed — the package is stdlib-only and mounted read-only
-# from the host at /app (see compose volumes). PYTHONPATH points there.
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# Healthcheck: GET /healthz on the same port the server binds to.
-# Note: the actual port comes from HINDSIGHT_MEMORIAL_PORT (default 9602);
-# HEALTHCHECK_PORT mirrors it via build arg so the dockerfile stays
-# configuration-light. Override at build time:
-#   docker build --build-arg MEMORIAL_PORT=9700 .
+# Copy the full source tree into the image. .dockerignore (if present) keeps
+# tests/, .git/, .venv/, etc. out; otherwise the image stays small anyway.
+COPY . /app
+
+# Healthcheck against the running server's /healthz. MEMORIAL_PORT defaults
+# to 9602; override via build arg if you also change the EXPOSE / CMD below.
 ARG MEMORIAL_PORT=9602
 ENV MEMORIAL_PORT=${MEMORIAL_PORT}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+__import__('os').environ['MEMORIAL_PORT']+'/healthz',timeout=3).read()==b'ok' else 1)"
+    CMD python -c "import urllib.request,sys,os; \
+sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ['MEMORIAL_PORT']+'/healthz',timeout=3).read()==b'ok' else 1)"
 
 EXPOSE 9602
 
