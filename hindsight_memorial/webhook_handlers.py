@@ -406,7 +406,11 @@ def handle_event(
             unit_id,
             text.strip()[:120],
         )
-        result = run_reconcile(text.strip(), load_cfg=loader)
+        result = run_reconcile(
+            text.strip(),
+            load_cfg=loader,
+            exclude_unit_ids=[unit_id] if unit_id else None,
+        )
         log.info(
             "unit %d/%d result=%s superseded=%d observations_cleared=%d error=%s",
             idx,

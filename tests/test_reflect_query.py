@@ -45,5 +45,58 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual(extract_superseded_ids(resp), [UUID_A])
 
 
+class ExcludeIdsTest(unittest.TestCase):
+    """``exclude_ids`` filters out the freshly retained fact itself so the
+    reflect LLM cannot trick memorial into PATCH-invalidating the current
+    truth (it sometimes lists the new fact alongside the ones it supersedes).
+    """
+
+    NEW_FACT = "44444444-4444-4444-4444-444444444444"
+
+    def test_excludes_id_in_structured_field(self):
+        resp = {
+            "structured_output": {
+                "superseded_fact_ids": [self.NEW_FACT, UUID_A, UUID_B]
+            }
+        }
+        # Without filter: 3 ids.
+        self.assertEqual(len(extract_superseded_ids(resp)), 3)
+        # With filter: 2 ids (NEW_FACT dropped).
+        self.assertEqual(
+            extract_superseded_ids(resp, exclude_ids=[self.NEW_FACT]),
+            [UUID_A, UUID_B],
+        )
+
+    def test_excludes_case_insensitive(self):
+        upper = self.NEW_FACT.upper()
+        resp = {
+            "structured_output": {"superseded_fact_ids": [upper, UUID_A]}
+        }
+        self.assertEqual(
+            extract_superseded_ids(resp, exclude_ids=[self.NEW_FACT]),
+            [UUID_A],
+        )
+
+    def test_excludes_id_in_text_fallback(self):
+        # When structured_output is empty, we fall back to scanning text.
+        resp = {
+            "structured_output": {},
+            "text": f"the new fact {self.NEW_FACT} supersedes {UUID_A}",
+        }
+        self.assertEqual(
+            extract_superseded_ids(resp, exclude_ids=[self.NEW_FACT]),
+            [UUID_A],
+        )
+
+    def test_exclude_ids_none_is_noop(self):
+        resp = {
+            "structured_output": {"superseded_fact_ids": [self.NEW_FACT, UUID_A]}
+        }
+        self.assertEqual(
+            extract_superseded_ids(resp, exclude_ids=None),
+            [self.NEW_FACT, UUID_A],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -86,6 +86,7 @@ def run_reconcile(
     load_cfg: ConfigLoader,
     cwd: str | None = None,
     dry_run: bool = False,
+    exclude_unit_ids: list[str] | None = None,
 ) -> ReconcileResult:
     """Run the shared retain → reconcile pipeline.
 
@@ -93,6 +94,12 @@ def run_reconcile(
     returns a MemorialConfig (or None to mean "no config / skip cleanly").
     The pipeline itself does not care how bank ids are resolved; it only
     takes the resolved MemorialConfig and runs reflect+curate against it.
+
+    ``exclude_unit_ids`` is forwarded to ``extract_superseded_ids`` so the
+    just-retained fact's own id is filtered out of the reflect response —
+    otherwise the reflect LLM sometimes lists the new fact alongside the
+    ones it supersedes and memorial would PATCH-invalidate the very fact
+    it just wrote.
     """
     if not new_fact or not new_fact.strip():
         return ReconcileResult(
@@ -183,7 +190,7 @@ def run_reconcile(
             new_fact_preview=new_fact[:120],
         )
 
-    superseded = extract_superseded_ids(reflect_resp)
+    superseded = extract_superseded_ids(reflect_resp, exclude_ids=exclude_unit_ids)
     if not superseded:
         return ReconcileResult(
             status="abandoned",

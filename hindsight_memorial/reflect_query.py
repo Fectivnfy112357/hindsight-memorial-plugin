@@ -65,14 +65,25 @@ _UUID_RE = re.compile(
 )
 
 
-def extract_superseded_ids(reflect_response: dict[str, Any]) -> list[str]:
+def extract_superseded_ids(
+    reflect_response: dict[str, Any],
+    exclude_ids: list[str] | None = None,
+) -> list[str]:
     """Pull the UUIDs out of the reflect response.
 
     Prefers the structured `structured_output.superseded_fact_ids` field. If that field is
     missing or empty, falls back to scanning the response text for UUIDs — the reflect LLM often
     repeats the ids inside `based_on.memories` or its prose answer, and we don't want to lose
     them just because structured-output parsing failed.
+
+    ``exclude_ids`` lets the caller drop the id of the freshly retained fact itself:
+    the reflect LLM sometimes lists the new fact alongside the ones it supersedes
+    (because its prompt asked for "facts this new one has rendered stale" and the
+    LLM reads "stale" loosely enough to include the new fact in its own enumeration).
+    Without this filter memorial would PATCH-invalidate the very fact it just
+    retained, losing the current truth.
     """
+    exclude = {str(x).lower() for x in (exclude_ids or []) if x}
     found: list[str] = []
 
     structured = reflect_response.get("structured_output")
@@ -80,7 +91,7 @@ def extract_superseded_ids(reflect_response: dict[str, Any]) -> list[str]:
         raw_ids = structured.get("superseded_fact_ids")
         if isinstance(raw_ids, list):
             for item in raw_ids:
-                if isinstance(item, str):
+                if isinstance(item, str) and item.lower() not in exclude:
                     found.append(item)
 
     if not found:
@@ -91,7 +102,8 @@ def extract_superseded_ids(reflect_response: dict[str, Any]) -> list[str]:
             text_candidates.append(reflect_response["text"])
         for blob in text_candidates:
             for match in _UUID_RE.findall(blob):
-                found.append(match)
+                if match.lower() not in exclude:
+                    found.append(match)
 
     # Deduplicate while preserving order, and validate UUID format.
     seen: set[str] = set()
