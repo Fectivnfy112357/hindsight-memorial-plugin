@@ -1,18 +1,16 @@
 """Unit tests for the shared ``hindsight_memorial.reconcile`` pipeline.
 
-These tests do not hit a live Hindsight server; they patch the
-``HindsightClient`` instance built inside ``run_reconcile`` and assert that
-the pipeline drives it correctly across retry, abandonment, and curate
-paths.
+Webhook-driven mode: ``run_reconcile`` performs a single reflect attempt.
+There is no client-side retry policy — if reflect fails, the result is
+``reflect_failed`` and the caller is expected to re-drive from the webhook
+later. These tests do not hit a live Hindsight server; they patch the
+``HindsightClient`` instance built inside ``run_reconcile``.
 """
 from __future__ import annotations
 
-import io
 import json
-import sys
 import unittest
-from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from unittest import mock
 
@@ -26,19 +24,6 @@ class FakeResponse:
 
     def read(self):
         return json.dumps(self.body).encode()
-
-
-@dataclass
-class FakeHTTPError:
-    code: int
-    msg: str = "err"
-
-    def read(self):
-        return b"{}"
-
-    @property
-    def reason(self):  # mimic urllib HTTPError.reason
-        return self.msg
 
 
 class FakeClient:
@@ -100,16 +85,6 @@ def _mem_cfg(bank_id: str = "b1") -> MemorialConfig:
     )
 
 
-class _RecordingSleep:
-    """Records every sleep call without blocking, so retry-path tests stay fast."""
-
-    def __init__(self) -> None:
-        self.calls: list[float] = []
-
-    def __call__(self, delay: float) -> None:
-        self.calls.append(delay)
-
-
 def _loader(cfg: MemorialConfig | None):
     def _l(cwd):
         return cfg
@@ -154,147 +129,56 @@ class BankPresenceTest(unittest.TestCase):
         self.assertEqual(result.available_bank_count, 1)
 
 
-class CleanOnFirstAttemptTest(unittest.TestCase):
-    def test_clean_on_first_attempt_no_retry(self):
+class SingleReflectAttemptTest(unittest.TestCase):
+    def test_clean_on_first_attempt(self):
+        mem_id = "11111111-1111-1111-1111-111111111111"
         client = FakeClient(
             banks=["b1"],
             reflect_seq=[
-                {"structured_output": {"superseded_fact_ids": ["11111111-1111-1111-1111-111111111111"], "reasoning": "x"}},
+                {"structured_output": {"superseded_fact_ids": [mem_id], "reasoning": "x"}},
             ],
-            patch_responses=[{"memory": {"id": "11111111-1111-1111-1111-111111111111", "state": "invalidated"}}],
+            patch_responses=[{"memory": {"id": mem_id, "state": "invalidated"}}],
             delete_responses=[{"deleted_count": 1}],
         )
-        sleeper = _RecordingSleep()
         with mock.patch.object(reconcile, "HindsightClient") as HC:
             HC.from_memorial_config.return_value = client
             outcome = reconcile.run_reconcile(
-                "x renamed to y",
-                load_cfg=_loader(_mem_cfg()),
-                sleep_fn=sleeper,
+                "x renamed to y", load_cfg=_loader(_mem_cfg())
             )
         self.assertEqual(outcome.status, "ok")
         self.assertEqual(outcome.superseded_count, 1)
-        # One attempt, only the initial wait — no retries fired.
-        self.assertEqual(outcome.attempts, 1)
-        self.assertEqual(sleeper.calls, [reconcile.RECONCILE_INITIAL_DELAY])
+        self.assertEqual(len(client.reflect_calls), 1)
 
-    def test_first_attempt_empty_retry_succeeds(self):
+    def test_no_supersession_returns_abandoned(self):
         client = FakeClient(
             banks=["b1"],
             reflect_seq=[
                 {"structured_output": {"superseded_fact_ids": [], "reasoning": "no"}},
-                {"structured_output": {"superseded_fact_ids": ["22222222-2222-2222-2222-222222222222"], "reasoning": "yes"}},
             ],
-            patch_responses=[{"memory": {"id": "22222222-2222-2222-2222-222222222222", "state": "invalidated"}}],
-            delete_responses=[{"deleted_count": 1}],
         )
-        sleeper = _RecordingSleep()
         with mock.patch.object(reconcile, "HindsightClient") as HC:
             HC.from_memorial_config.return_value = client
             outcome = reconcile.run_reconcile(
-                "x renamed to y",
-                load_cfg=_loader(_mem_cfg()),
-                sleep_fn=sleeper,
-            )
-        self.assertEqual(outcome.status, "ok")
-        self.assertEqual(outcome.superseded_count, 1)
-        self.assertEqual(outcome.attempts, 2)
-        self.assertEqual(
-            sleeper.calls,
-            [reconcile.RECONCILE_INITIAL_DELAY, reconcile.RECONCILE_RETRY_DELAYS[0]],
-        )
-
-    def test_abandons_after_initial_and_all_retries_empty(self):
-        # Initial reflect empty + 2 retry reflects empty -> 3 attempts total.
-        client = FakeClient(
-            banks=["b1"],
-            reflect_seq=[
-                {"structured_output": {"superseded_fact_ids": [], "reasoning": "no"}},
-                {"structured_output": {"superseded_fact_ids": [], "reasoning": "no"}},
-                {"structured_output": {"superseded_fact_ids": [], "reasoning": "no"}},
-            ],
-        )
-        sleeper = _RecordingSleep()
-        with mock.patch.object(reconcile, "HindsightClient") as HC:
-            HC.from_memorial_config.return_value = client
-            outcome = reconcile.run_reconcile(
-                "anything",
-                load_cfg=_loader(_mem_cfg()),
-                sleep_fn=sleeper,
+                "anything", load_cfg=_loader(_mem_cfg())
             )
         self.assertEqual(outcome.status, "abandoned")
-        # attempts = 1 initial + len(RECONCILE_RETRY_DELAYS) retries
-        self.assertEqual(
-            outcome.attempts,
-            1 + len(reconcile.RECONCILE_RETRY_DELAYS),
-        )
-        self.assertEqual(
-            sleeper.calls,
-            [reconcile.RECONCILE_INITIAL_DELAY, *reconcile.RECONCILE_RETRY_DELAYS],
-        )
         self.assertIn("no superseded facts", outcome.reason or "")
+        self.assertEqual(len(client.reflect_calls), 1)
 
-    def test_reflect_error_initial_then_retry_succeeds(self):
-        # Initial reflect fails, retry succeeds.
-        client = FakeClient(
-            banks=["b1"],
-            reflect_seq=[
-                {"structured_output": {"superseded_fact_ids": ["33333333-3333-3333-3333-333333333333"], "reasoning": "yes"}},
-            ],
-            patch_responses=[{"memory": {"id": "33333333-3333-3333-3333-333333333333", "state": "invalidated"}}],
-            delete_responses=[{"deleted_count": 1}],
-        )
-        sleeper = _RecordingSleep()
-        err = reconcile.HindsightAPIError(500, "boom", "http://test/reflect")
-        with mock.patch.object(reconcile, "HindsightClient") as HC:
-            HC.from_memorial_config.return_value = client
-            # First call: raise; subsequent calls: succeed from reflect_seq.
-            original = client.reflect
-            call_state = {"n": 0}
-
-            def reflect(bank_id, query, **kw):
-                call_state["n"] += 1
-                if call_state["n"] == 1:
-                    raise err
-                return original(bank_id, query, **kw)
-
-            client.reflect = reflect
-            outcome = reconcile.run_reconcile(
-                "x renamed to y",
-                load_cfg=_loader(_mem_cfg()),
-                sleep_fn=sleeper,
-            )
-        self.assertEqual(outcome.status, "ok")
-        self.assertEqual(outcome.superseded_count, 1)
-        self.assertEqual(outcome.attempts, 2)
-        self.assertEqual(
-            sleeper.calls,
-            [reconcile.RECONCILE_INITIAL_DELAY, reconcile.RECONCILE_RETRY_DELAYS[0]],
-        )
-
-    def test_all_attempts_error_returns_reflect_failed(self):
+    def test_reflect_error_returns_reflect_failed(self):
         err = reconcile.HindsightAPIError(500, "boom", "http://test/reflect")
         client = FakeClient(
             banks=["b1"],
-            reflect_errors=[err, err, err],
+            reflect_errors=[err],
         )
-        sleeper = _RecordingSleep()
         with mock.patch.object(reconcile, "HindsightClient") as HC:
             HC.from_memorial_config.return_value = client
             outcome = reconcile.run_reconcile(
-                "anything",
-                load_cfg=_loader(_mem_cfg()),
-                sleep_fn=sleeper,
+                "anything", load_cfg=_loader(_mem_cfg())
             )
         self.assertEqual(outcome.status, "reflect_failed")
-        self.assertEqual(
-            outcome.attempts,
-            1 + len(reconcile.RECONCILE_RETRY_DELAYS),
-        )
-        self.assertEqual(
-            sleeper.calls,
-            [reconcile.RECONCILE_INITIAL_DELAY, *reconcile.RECONCILE_RETRY_DELAYS],
-        )
+        self.assertEqual(outcome.error, str(err))
+        self.assertEqual(len(client.reflect_calls), 1)
 
 
 class CurateResultsTest(unittest.TestCase):
@@ -311,9 +195,7 @@ class CurateResultsTest(unittest.TestCase):
         with mock.patch.object(reconcile, "HindsightClient") as HC:
             HC.from_memorial_config.return_value = client
             outcome = reconcile.run_reconcile(
-                "x renamed to y",
-                load_cfg=_loader(_mem_cfg()),
-                sleep_fn=lambda *_a, **_k: None,
+                "x renamed to y", load_cfg=_loader(_mem_cfg())
             )
         self.assertEqual(outcome.status, "ok")
         self.assertEqual(len(outcome.results), 1)
@@ -327,14 +209,12 @@ class CurateResultsTest(unittest.TestCase):
 class DryRunTest(unittest.TestCase):
     def test_dry_run_skips_reflect_and_curate(self):
         client = FakeClient(banks=["b1"])
-        sleeps: list[float] = []
         with mock.patch.object(reconcile, "HindsightClient") as HC:
             HC.from_memorial_config.return_value = client
             outcome = reconcile.run_reconcile(
                 "foo renamed to bar",
                 load_cfg=_loader(_mem_cfg()),
                 dry_run=True,
-                sleep_fn=sleeps.append,
             )
         self.assertEqual(outcome.status, "dry_run")
         self.assertEqual(client.reflect_calls, [])
