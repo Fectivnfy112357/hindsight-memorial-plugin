@@ -250,6 +250,8 @@ def handle_event(
         event_name,
         bool(sig),
     )
+    # TEMP DEBUG: dump the raw body so we can see why parse_event rejects it.
+    log.info("webhook raw body: %r", raw_body.decode("utf-8", errors="replace"))
 
     if not verify_signature(raw_body, sig, secret):
         log.warning("signature verification failed (event=%r)", event_name)
