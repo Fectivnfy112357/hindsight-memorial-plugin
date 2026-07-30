@@ -86,6 +86,11 @@ def _on_post_tool_call(
     duration_ms: int,
     **kwargs: Any,
 ) -> None:
+    log.info(
+        "memorial: post_tool_call fired tool=%r args_keys=%s",
+        tool_name,
+        sorted(args.keys()) if isinstance(args, dict) else type(args).__name__,
+    )
     if not _is_retain_tool(tool_name):
         return
 
