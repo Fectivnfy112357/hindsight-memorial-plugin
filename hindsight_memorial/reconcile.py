@@ -121,9 +121,10 @@ def run_reconcile(
 
     try:
         client = HindsightClient.from_memorial_config(cfg)
-    except Exception as e:  # pragma: no cover - depends on env
-        log.error("client init failed bank=%s: %s", cfg.bank_id, e)
-        return ReconcileResult(status="error", error=f"client init failed: {e}")
+    except Exception:  # pragma: no cover - depends on env
+        # Use log.exception so the full traceback lands in the log file.
+        log.exception("client init failed bank=%s", cfg.bank_id)
+        return ReconcileResult(status="error", error="client init failed (see logs)")
 
     try:
         bank_ids = client.list_banks()

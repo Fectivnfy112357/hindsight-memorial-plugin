@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .client import HindsightClient
-from .webhook_handlers import configure_logging, handle_event
+from .webhook_handlers import WebhookOutcome, configure_logging, handle_event
 
 log = logging.getLogger("hindsight_memorial.webhook_server")
 
@@ -58,45 +58,7 @@ def _make_handler(secret: bytes):
             length = int(self.headers.get("Content-Length", "0") or "0")
             raw_body = self.rfile.read(length) if length > 0 else b""
             headers = {k: v for k, v in self.headers.items()}
-
-            def fetch_units(bank_id: str, document_id: str):
-                api_url = os.environ.get("HINDSIGHT_API_URL", "").strip()
-                if not api_url:
-                    log.warning(
-                        "fetch_units called but HINDSIGHT_API_URL is unset "
-                        "(bank=%s document=%s)",
-                        bank_id,
-                        document_id,
-                    )
-                    return []
-                client = HindsightClient(
-                    base_url=api_url.rstrip("/"),
-                    api_key=os.environ.get("HINDSIGHT_API_KEY"),
-                )
-                return client.list_memory_units(bank_id, document_id)
-
-            outcome = handle_event(
-                raw_body, headers, secret=secret, fetch_units=fetch_units
-            )
-            log.info(
-                "webhook processed: status=%s bank=%s document=%s "
-                "units=%d superseded=%d observations_cleared=%d",
-                outcome.status,
-                outcome.bank_id,
-                outcome.document_id,
-                outcome.units_processed,
-                outcome.total_superseded,
-                outcome.total_observations_cleared,
-            )
-            # 200 for every well-formed-but-rejected request (bad signature,
-            # non-retain event, empty doc) so Hindsight's outbox doesn't enter
-            # its 5s/5min/30min/2h/5h retry storm. 400 only for malformed bytes.
-            status = (
-                HTTPStatus.BAD_REQUEST
-                if outcome.error == "malformed payload"
-                else HTTPStatus.OK
-            )
-            payload = json.dumps(outcome.to_dict()).encode("utf-8")
+            payload, status = _process_post(raw_body, headers, secret=secret)
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -113,6 +75,79 @@ def _make_handler(secret: bytes):
             self.send_error(HTTPStatus.NOT_FOUND, "unknown endpoint")
 
     return WebhookHandler
+
+
+def _process_post(
+    raw_body: bytes,
+    headers: dict[str, str],
+    *,
+    secret: bytes,
+) -> tuple[bytes, int]:
+    """Process one /webhook/hindsight request and return (response_body, status).
+
+    Extracted from ``do_POST`` so it can be exercised without spinning up a
+    real BaseHTTPRequestHandler. Handles the full chain:
+
+      1. Build a fetch_units closure that talks to Hindsight's /memories/list.
+      2. Call ``handle_event`` inside a try/except so any unhandled exception
+         still produces a 200 response with a status=error body — this keeps
+         Hindsight's outbox from entering its 5s/5min/30min/2h/5h retry storm.
+      3. Pick HTTP status: 400 only if the body was malformed bytes; 200
+         otherwise (including signature failures, non-retain events, empty
+         documents, and unhandled bugs).
+    """
+    def fetch_units(bank_id: str, document_id: str):
+        api_url = os.environ.get("HINDSIGHT_API_URL", "").strip()
+        if not api_url:
+            log.warning(
+                "fetch_units called but HINDSIGHT_API_URL is unset "
+                "(bank=%s document=%s)",
+                bank_id,
+                document_id,
+            )
+            return []
+        client = HindsightClient(
+            base_url=api_url.rstrip("/"),
+            api_key=os.environ.get("HINDSIGHT_API_KEY"),
+        )
+        return client.list_memory_units(bank_id, document_id)
+
+    try:
+        outcome = handle_event(
+            raw_body, headers, secret=secret, fetch_units=fetch_units
+        )
+    except Exception:  # noqa: BLE001 — we want to log literally everything
+        # Catch-all so any unhandled bug still returns 200 to Hindsight
+        # (avoids the 5s/5min/30min/2h/5h outbox retry storm) and writes
+        # a full traceback to the log file. Without this, an uncaught
+        # exception produces a bare 500 with no diagnostic output.
+        log.exception(
+            "unhandled exception in webhook handler "
+            "(bytes=%d event_header=%r)",
+            len(raw_body),
+            headers.get("X-Hindsight-Event") or headers.get("x-hindsight-event"),
+        )
+        outcome = WebhookOutcome(
+            status="error",
+            error="internal handler error (see logs)",
+        )
+
+    log.info(
+        "webhook processed: status=%s bank=%s document=%s "
+        "units=%d superseded=%d observations_cleared=%d",
+        outcome.status,
+        outcome.bank_id,
+        outcome.document_id,
+        outcome.units_processed,
+        outcome.total_superseded,
+        outcome.total_observations_cleared,
+    )
+    status = (
+        HTTPStatus.BAD_REQUEST
+        if outcome.error == "malformed payload"
+        else HTTPStatus.OK
+    )
+    return json.dumps(outcome.to_dict()).encode("utf-8"), status
 
 
 def serve(host: str, port: int, secret: bytes) -> None:
