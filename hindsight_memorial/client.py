@@ -200,6 +200,13 @@ class HindsightClient:
         just-completed document so we can run reconcile per-unit. Pagination is naive:
         we keep calling until the page comes back smaller than ``limit`` or we hit a
         hard cap to avoid runaway loops on a misconfigured server.
+
+        Response shape (per Hindsight v0.8.x):
+
+            {"items": [{...memory_unit dicts...}], "total": N, "limit": L, "offset": O}
+
+        Each unit carries ``id`` (UUID), ``text`` (the extracted fact body), ``fact_type``
+        (world / experience / observation), and ``document_id``.
         """
         path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories/list"
         all_units: list[dict[str, Any]] = []
@@ -209,7 +216,8 @@ class HindsightClient:
                 path,
                 query={"document_id": document_id, "limit": limit, "offset": offset},
             )
-            page = resp.get("memory_units", []) if isinstance(resp, dict) else []
+            # Hindsight returns the page under "items", not "memory_units".
+            page = resp.get("items", []) if isinstance(resp, dict) else []
             if not isinstance(page, list):
                 page = []
             all_units.extend(u for u in page if isinstance(u, dict))

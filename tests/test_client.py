@@ -105,5 +105,70 @@ class UrlEncodingTest(unittest.TestCase):
         self.assertIn("/banks/bank%2Fone/memories/abc", seen[0])
 
 
+class ListMemoryUnitsTest(unittest.TestCase):
+    """Hindsight /memories/list returns items under the ``items`` key (not
+    ``memory_units``). The client must read it correctly even when the page
+    is full (paginate) or partial (terminate).
+    """
+
+    def _resp_body(self, units: list[dict], total: int):
+        return {
+            "items": units,
+            "total": total,
+            "limit": 100,
+            "offset": 0,
+        }
+
+    def test_parses_items_field(self):
+        unit = {
+            "id": "5a0e493d-9581-4b45-acd7-abfc3a288cc1",
+            "text": "用户当前居住在日本 | Involving: user",
+            "fact_type": "world",
+            "document_id": "用户居住地",
+            "state": "valid",
+        }
+        with mock.patch.object(
+            client_mod.urllib.request, "urlopen", return_value=_resp(self._resp_body([unit], 1))
+        ):
+            units = HindsightClient(base_url="http://t").list_memory_units("bank-1", "用户居住地")
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0]["id"], unit["id"])
+        self.assertEqual(units[0]["text"], unit["text"])
+
+    def test_paginates_until_short_page(self):
+        page1 = [{"id": f"u-{i}", "text": f"t-{i}"} for i in range(3)]
+        page2 = [{"id": "u-99", "text": "final"}]
+        seen_offset: list[int] = []
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            from urllib.parse import parse_qs, urlparse
+
+            q = parse_qs(urlparse(req.full_url).query)
+            seen_offset.append(int(q["offset"][0]))
+            offset = seen_offset[-1]
+            if offset == 0:
+                return _resp(self._resp_body(page1, 4))
+            return _resp(self._resp_body(page2, 4))
+
+        with mock.patch.object(client_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            units = HindsightClient(base_url="http://t", timeout=5).list_memory_units(
+                "bank-1", "doc-1", limit=3
+            )
+        self.assertEqual(len(units), 4)
+        self.assertEqual([u["id"] for u in units], ["u-0", "u-1", "u-2", "u-99"])
+
+    def test_handles_unicode_document_id(self):
+        seen_urls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            seen_urls.append(req.full_url)
+            return _resp(self._resp_body([], 0))
+
+        with mock.patch.object(client_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            HindsightClient(base_url="http://t").list_memory_units("bank-1", "用户居住地")
+        # document_id must be percent-encoded, not raw UTF-8 in the URL.
+        self.assertIn("document_id=%E7%94%A8%E6%88%B7%E5%B1%85%E4%BD%8F%E5%9C%B0", seen_urls[0])
+
+
 if __name__ == "__main__":
     unittest.main()

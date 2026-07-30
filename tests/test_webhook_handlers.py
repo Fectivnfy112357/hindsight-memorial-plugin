@@ -143,18 +143,23 @@ class HandleEventTest(unittest.TestCase):
         outcome = self._run(body=body, units=[])
         self.assertEqual(outcome.status, "ignored")
 
-    def test_zero_memory_unit_count_skipped(self):
+    def test_zero_hint_but_no_units_skipped(self):
+        """The webhook server's count hint is not authoritative — we always
+        query /memories/list and only skip when that returns 0. So even
+        count_hint=0 + units=[] results in a skip, but the reason comes
+        from the (empty) list query, not the count hint.
+        """
         body = _retain_event(memory_unit_count=0)
         outcome = self._run(body=body, units=[])
         self.assertEqual(outcome.status, "skipped")
         self.assertEqual(outcome.memory_unit_count, 0)
-        self.assertIn("memory_unit_count", outcome.reason or "")
+        self.assertIn("list", outcome.reason or "")
 
     def test_no_units_returned_skipped(self):
         body = _retain_event(memory_unit_count=2)
         outcome = self._run(body=body, units=[])
         self.assertEqual(outcome.status, "skipped")
-        self.assertEqual(outcome.units_skipped, 2)
+        self.assertIn("list", outcome.reason or "")
 
     def test_per_unit_reconcile_each_call(self):
         """One unit with stale fact → reconcile runs reflect+curate per unit."""

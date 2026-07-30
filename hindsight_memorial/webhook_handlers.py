@@ -279,26 +279,18 @@ def handle_event(
         evt.operation_id,
     )
 
-    if evt.memory_unit_count == 0:
-        log.info(
-            "skipped: zero-fact batch bank=%s document=%s",
-            evt.bank_id,
-            evt.document_id,
-        )
-        return WebhookOutcome(
-            status="skipped",
-            bank_id=evt.bank_id,
-            document_id=evt.document_id,
-            memory_unit_count=0,
-            reason="memory_unit_count == 0; nothing to reconcile",
-        )
-
+    # NOTE: ``memory_unit_count`` is the server's pre-extraction hint, not an
+    # authoritative truth. We've observed cases where the count is 0 but
+    # /memories/list still returns units (the UI shows them), and cases where
+    # it's >0 but no units are retrievable. Always do the actual query —
+    # the list endpoint is the single source of truth.
     units = fetch_units(evt.bank_id, evt.document_id)
     log.info(
-        "fetched units: bank=%s document=%s units=%d",
+        "fetched units: bank=%s document=%s units=%d (server_hint=%d)",
         evt.bank_id,
         evt.document_id,
         len(units),
+        evt.memory_unit_count,
     )
     if not units:
         log.info(
@@ -311,8 +303,7 @@ def handle_event(
             bank_id=evt.bank_id,
             document_id=evt.document_id,
             memory_unit_count=evt.memory_unit_count,
-            units_skipped=evt.memory_unit_count,
-            reason="no memory_units returned by /memories/list",
+            reason="no memory_units returned by /memories/list (count hint from server may be unreliable)",
         )
 
     loader = webhook_config_loader(evt.bank_id)
