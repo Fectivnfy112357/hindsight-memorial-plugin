@@ -186,6 +186,14 @@ def parse_event(raw_body: bytes) -> RetainEvent | None:
     )
 
 
+def _safe_json(raw_body: bytes) -> Any:
+    """Parse JSON body for diagnostic logging. Never raises — returns None on any error."""
+    try:
+        return json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 # ── config loader for the webhook path ───────────────────────────────────
 
 
@@ -262,14 +270,27 @@ def handle_event(
 
     evt = parse_event(raw_body)
     if evt is None:
+        # parse_event returns None for any of: malformed JSON, body.event !=
+        # 'retain.completed', missing/non-string bank_id, missing/non-dict data,
+        # or missing/empty data.document_id. The body dump above shows which
+        # case actually fired; the previous message "not a retain.completed
+        # event" was misleading (we now know data={} is the common mode).
+        body_obj = _safe_json(raw_body)
+        body_event = body_obj.get("event") if isinstance(body_obj, dict) else None
+        data_obj = body_obj.get("data") if isinstance(body_obj, dict) else None
+        has_doc_id = isinstance(data_obj, dict) and bool(data_obj.get("document_id"))
         log.warning(
-            "payload rejected: not a retain.completed event (event_header=%r)",
+            "payload rejected by parse_event "
+            "(event_header=%r body_event=%r data=%r has_document_id=%s)",
             event_name,
+            body_event,
+            data_obj,
+            has_doc_id,
         )
         return WebhookOutcome(
             status="ignored",
             error=(
-                f"payload not a retain.completed event (X-Hindsight-Event={event_name!r})"
+                f"payload rejected by parse_event (X-Hindsight-Event={event_name!r})"
             ),
         )
 
@@ -292,6 +313,7 @@ def handle_event(
         evt.bank_id,
         evt.document_id,
         len(units),
+
         evt.memory_unit_count,
     )
     if not units:
