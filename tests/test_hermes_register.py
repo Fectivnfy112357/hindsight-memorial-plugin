@@ -6,34 +6,43 @@ These tests cover (a) bank-id resolution rules under ``HERMES_HOME`` and
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from hindsight_memorial.config import MemorialConfig
+# Stand in for the ``hermes_plugins.<slug>`` package that Hermes would
+# normally host us under. Building a fake parent package is no longer
+# necessary because the plugin's ``__init__.py`` resolves its imports via
+# ``sys.path.insert`` rather than relative ``.hindsight_memorial…``. We
+# still isolate the load by using a unique synthetic module name so that
+# any stray imports are reversible between tests.
 
-# The Hermes plugin entrypoint lives at the project root so that
-# `~/.hermes/plugins/hindsight-memorial/__init__.py` resolves as a
-# standalone spec when Hermes loads plugins.
-import hermes_config
-from hermes_config import (
-    build_loader,
-    load_hermes_config,
-    read_config,
-)
 
-import importlib.util
+def _load_hermes_plugin():
+    project_root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "hindsight_memorial_hermes_entry", project_root / "__init__.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location(
-    "hermes_plugin_entry", _PROJECT_ROOT / "__init__.py"
-)
-_hermes_plugin = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_hermes_plugin)
+
+_hermes_plugin = _load_hermes_plugin()
 register = _hermes_plugin.register
+
+# Supporting helpers are imported via the shared backend package. Importing
+# them the regular way is fine now that the project's __init__.py only ever
+# touches sys.path — no relative-importer assumptions leak back here.
+from hindsight_memorial.config import MemorialConfig  # noqa: E402
+from hermes_config import load_hermes_config, read_config  # noqa: E402
 
 
 def _write_hermes_config(home: Path, data: dict) -> None:

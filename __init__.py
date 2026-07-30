@@ -22,11 +22,31 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
-from hindsight_memorial.reconcile import run_reconcile
+# When this plugin is loaded by Hermes, the surrounding package is
+# ``hermes_plugins.hindsight_memorial`` and its ``__path__`` includes this
+# directory. ``hindsight_memorial`` (the shared backend) sits as a sibling
+# subpackage, and ``hermes_config.py`` as a sibling module. Both ``..`` and
+# relative imports work because ``module.__package__`` is set by
+# ``hermes_cli.plugins._load_directory_module``.
+#
+# However, when the same file is imported through other code paths (legacy
+# direct import, tools that place this directory on ``sys.path`` for
+# inspection), the parent package context is missing. To stay importable from
+# any of those paths we resolve the absolute references directly here. The
+# cost is one ``sys.path.insert`` per process — harmless.
+_PLUGIN_DIR = Path(__file__).resolve().parent
+if str(_PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_DIR))
 
-from hermes_config import build_loader, read_config
+from hindsight_memorial.reconcile import run_reconcile  # noqa: E402
+import hermes_config  # noqa: E402
+
+build_loader = hermes_config.build_loader
+read_config = hermes_config.read_config
 
 log = logging.getLogger("hindsight_memorial.hermes")
 
