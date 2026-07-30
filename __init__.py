@@ -102,16 +102,26 @@ def _load_hermes_config(cwd: str | None = None) -> MemorialConfig | None:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         log.debug("memorial: no config at %s", config_path)
 
-    # Bank resolution: env > directoryBankMap > static bank_id
+    # Bank resolution must mirror Hermes' Hindsight provider. Its config has a
+    # session-wide ``bank_id``; only an explicit directoryBankMap match should
+    # override it. Falling back to basename(cwd) here would make retain write to
+    # one bank while memorial reflects/curates a different one.
     env_bank = os.environ.get("HINDSIGHT_BANK_ID")
     if env_bank:
         bank_id: str | None = env_bank
         bank_source = "env"
-    elif cwd:
-        bank_id, bank_source = resolve_bank_id(cfg, cwd)
     else:
-        bank_id = cfg.get("bank_id")
-        bank_source = "hermes_config" if bank_id else "none"
+        mapped_bank: str | None = None
+        if cwd:
+            resolved_bank, resolved_source = resolve_bank_id(cfg, cwd)
+            if resolved_source == "directoryBankMap":
+                mapped_bank = resolved_bank
+        if mapped_bank:
+            bank_id = mapped_bank
+            bank_source = "directoryBankMap"
+        else:
+            bank_id = cfg.get("bank_id")
+            bank_source = "hermes_config" if bank_id else "none"
 
     return MemorialConfig(
         api_url=api_url.rstrip("/"),
