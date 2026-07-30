@@ -1,20 +1,22 @@
-"""Shared retain → reflect → curate pipeline used by both adapters.
+"""Shared retain → reflect → curate pipeline used by the webhook entry point.
 
-Adapters (Claude Code CLI, Hermes plugin) all need the same logic:
+Flow:
 
   1. Build a HindsightClient from MemorialConfig.
   2. Verify the resolved bank exists on the server.
-  3. Run reflect() with a bounded retry to absorb write→index visibility lag.
+  3. Run reflect() **once** to ask which existing facts the new one supersedes.
   4. Curate any UUIDs identified as superseded.
 
-The only adapter-specific pieces are config loading and (for the CLI) how the
-new_fact and cwd arrive. Both adapters call `run_reconcile(new_fact, *,
-load_cfg, ...)` so the pipeline lives in exactly one place.
+Why a single attempt: the webhook fires *after* ``retain.completed``, i.e. the
+server has already committed and indexed the new fact. The old 30s initial
+delay + retry loop existed because hooks fired *before* indexing caught up —
+no longer applicable. If reflect itself fails, callers should treat it as a
+hard failure and re-drive from the webhook later; we surface the error in
+the result.
 """
 from __future__ import annotations
 
 import logging
-import time as _time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
@@ -29,27 +31,6 @@ from .reflect_query import (
 
 log = logging.getLogger("hindsight_memorial.reconcile")
 
-# Reflect retry policy.
-#
-# After a retain lands, the new fact may not be queryable via reflect for a
-# short window (write→index visibility lag on the Hindsight backend). The
-# pipeline below implements the user-specified semantics:
-#
-#   1. Sleep RECONCILE_INITIAL_DELAY seconds, then run reflect() once.
-#      If that returns 1+ superseded UUIDs, curate them and return — no
-#      further attempts.
-#   2. If reflect raised an error OR returned no superseded UUIDs, sleep
-#      the next value from RECONCILE_RETRY_DELAYS, then try reflect() again.
-#   3. Repeat step 2 for as many retry delays as are configured. After the
-#      last delay, return status="abandoned" or "reflect_failed".
-#
-# RECONCILE_RETRY_DELAYS is a tuple so adding a third retry is a one-line
-# change. The tuple's length is the maximum number of *retries* — the first
-# attempt is not counted as a retry because the user wants it preceded by
-# RECONCILE_INITIAL_DELAY only.
-RECONCILE_INITIAL_DELAY = 30.0
-RECONCILE_RETRY_DELAYS = (30.0, 30.0)
-
 
 @dataclass
 class ReconcileResult:
@@ -57,8 +38,6 @@ class ReconcileResult:
 
     status: str  # "ok" | "abandoned" | "skipped" | "list_banks_failed" | "reflect_failed" | "error"
     superseded_count: int = 0
-    attempts: int = 0
-    elapsed_seconds: float = 0.0
     bank_id: str | None = None
     bank_source: str | None = None
     new_fact_preview: str = ""
@@ -74,8 +53,6 @@ class ReconcileResult:
         out: dict[str, Any] = {
             "status": self.status,
             "superseded_count": self.superseded_count,
-            "attempts": self.attempts,
-            "elapsed_seconds": self.elapsed_seconds,
             "bank_id": self.bank_id,
             "bank_source": self.bank_source,
         }
@@ -98,9 +75,8 @@ class ReconcileResult:
         return out
 
 
-# Type alias for the per-adapter config loader. Adapters implement this to
-# surface their own bank-id resolution rules (Hermes: env > config > cwd
-# directoryBankMap; Claude Code: env > ~/.hindsight/claude-code.json > cwd).
+# Type alias for the per-call config loader. The webhook entry point
+# implements this to resolve the bank id from the event payload + env.
 ConfigLoader = Callable[[str | None], MemorialConfig | None]
 
 
@@ -110,20 +86,14 @@ def run_reconcile(
     load_cfg: ConfigLoader,
     cwd: str | None = None,
     dry_run: bool = False,
-    sleep_fn: Callable[[float], None] | None = None,
 ) -> ReconcileResult:
     """Run the shared retain → reconcile pipeline.
 
-    ``load_cfg`` is an adapter-supplied callable that takes ``cwd`` and
+    ``load_cfg`` is a webhook-supplied callable that takes ``cwd`` and
     returns a MemorialConfig (or None to mean "no config / skip cleanly").
     The pipeline itself does not care how bank ids are resolved; it only
     takes the resolved MemorialConfig and runs reflect+curate against it.
-
-    ``sleep_fn`` defaults to ``time.sleep`` looked up per call, not at
-    import time, so tests can ``mock.patch`` it cleanly.
     """
-    if sleep_fn is None:
-        sleep_fn = _time.sleep
     if not new_fact or not new_fact.strip():
         return ReconcileResult(
             status="skipped",
@@ -187,16 +157,6 @@ def run_reconcile(
             query_preview=query[:200],
         )
 
-    # Attempt 1: wait INITIAL, reflect, return as soon as we have a hit.
-    attempts = 0
-    total_delay = 0.0
-    superseded: list[str] = []
-    last_error: str | None = None
-
-    sleep_fn(RECONCILE_INITIAL_DELAY)
-    total_delay += RECONCILE_INITIAL_DELAY
-    attempts = 1
-
     try:
         reflect_resp = client.reflect(
             cfg.bank_id,
@@ -205,71 +165,30 @@ def run_reconcile(
             include_based_on=False,
         )
     except HindsightAPIError as e:
-        last_error = str(e)
-        log.warning("reflect attempt %d failed: %s", attempts, e)
-    else:
-        superseded = extract_superseded_ids(reflect_resp)
-        if superseded:
-            return _curate_and_return(
-                client=client,
-                cfg=cfg,
-                new_fact=new_fact,
-                superseded=superseded,
-                attempts=attempts,
-                total_delay=total_delay,
-            )
-
-    # Retries: each entry in RECONCILE_RETRY_DELAYS adds (sleep + reflect).
-    for delay in RECONCILE_RETRY_DELAYS:
-        sleep_fn(delay)
-        total_delay += delay
-        attempts += 1
-
-        try:
-            reflect_resp = client.reflect(
-                cfg.bank_id,
-                query,
-                structured_output=SUPERSEDED_SCHEMA,
-                include_based_on=False,
-            )
-        except HindsightAPIError as e:
-            last_error = str(e)
-            log.warning("reflect attempt %d failed: %s", attempts, e)
-            continue
-
-        superseded = extract_superseded_ids(reflect_resp)
-        if superseded:
-            return _curate_and_return(
-                client=client,
-                cfg=cfg,
-                new_fact=new_fact,
-                superseded=superseded,
-                attempts=attempts,
-                total_delay=total_delay,
-            )
-
-    if last_error is not None:
+        log.warning("reflect failed: %s", e)
         return ReconcileResult(
             status="reflect_failed",
-            error=last_error,
-            attempts=attempts,
-            elapsed_seconds=total_delay,
+            error=str(e),
             bank_id=cfg.bank_id,
             bank_source=cfg.bank_source,
             new_fact_preview=new_fact[:120],
         )
 
-    return ReconcileResult(
-        status="abandoned",
-        reason=(
-            f"no superseded facts detected within retry window "
-            f"({attempts} attempt(s), {total_delay:.0f}s elapsed)"
-        ),
-        attempts=attempts,
-        elapsed_seconds=total_delay,
-        bank_id=cfg.bank_id,
-        bank_source=cfg.bank_source,
-        new_fact_preview=new_fact[:120],
+    superseded = extract_superseded_ids(reflect_resp)
+    if not superseded:
+        return ReconcileResult(
+            status="abandoned",
+            reason="no superseded facts detected",
+            bank_id=cfg.bank_id,
+            bank_source=cfg.bank_source,
+            new_fact_preview=new_fact[:120],
+        )
+
+    return _curate_and_return(
+        client=client,
+        cfg=cfg,
+        new_fact=new_fact,
+        superseded=superseded,
     )
 
 
@@ -279,8 +198,6 @@ def _curate_and_return(
     cfg: MemorialConfig,
     new_fact: str,
     superseded: list[str],
-    attempts: int,
-    total_delay: float,
 ) -> ReconcileResult:
     reason = f"Superseded by newly retained fact: {new_fact[:200]}"
     report: CurateReport = curate_many(
@@ -289,8 +206,6 @@ def _curate_and_return(
     return ReconcileResult(
         status="ok",
         superseded_count=len(superseded),
-        attempts=attempts,
-        elapsed_seconds=total_delay,
         bank_id=cfg.bank_id,
         bank_source=cfg.bank_source,
         new_fact_preview=new_fact[:120],
@@ -302,7 +217,6 @@ def _curate_and_return(
 
 __all__ = [
     "ConfigLoader",
-    "RECONCILE_REFLECT_DELAYS",
     "ReconcileResult",
     "run_reconcile",
 ]

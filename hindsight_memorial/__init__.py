@@ -1,11 +1,9 @@
-"""hindsight-memorial: client-side pollution cleanup library."""
+"""hindsight-memorial: webhook-driven Hindsight memory pollution cleanup."""
 
 from .client import HindsightAPIError, HindsightClient
 from .config import MemorialConfig, load_config, resolve_bank_id
 from .curate import CurateReport, CurateResult, curate_many, curate_memory
 from .reconcile import (
-    RECONCILE_INITIAL_DELAY,
-    RECONCILE_RETRY_DELAYS,
     ConfigLoader,
     ReconcileResult,
     run_reconcile,
@@ -26,8 +24,6 @@ __all__ = [
     "CurateResult",
     "curate_many",
     "curate_memory",
-    "RECONCILE_INITIAL_DELAY",
-    "RECONCILE_RETRY_DELAYS",
     "ConfigLoader",
     "ReconcileResult",
     "run_reconcile",
