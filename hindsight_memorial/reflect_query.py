@@ -36,17 +36,26 @@ def build_query(new_fact_text: str, *, bank_id: str) -> str:
 
     The prompt is intentionally narrow: only ask about *supersession*, not general cleanup. This
     keeps the reflect LLM focused and reduces the chance of it inventing unrelated edits.
+
+    Note on temporal wording: a new fact may use past-tense markers ("曾", "previously lived in")
+    while still expressing a corrective update on a current-state fact. The LLM should treat
+    topic-level supersession as the trigger, not tense alone.
     """
     return (
         f"A new fact was just retained into bank `{bank_id}`:\n\n"
         f"    >>> {new_fact_text.strip()} <<<\n\n"
         "Inspect the existing facts in this bank. Return the UUIDs of any facts that this new one\n"
-        "has rendered **stale, contradicted, or directly superseded**. Examples:\n"
+        "has rendered stale, contradicted, or directly superseded. Look for facts about the SAME\n"
+        "topic (user location, preferences, project state, file paths, tool choices, etc.) — even if\n"
+        "the new fact uses past tense (\"曾\", \"previously\", \"used to\") it can still supersede a\n"
+        "current-state fact that contradicts it. Examples:\n"
         "  - a previous fact named the same file/method/module by an old name\n"
         "  - a previous fact recorded a path that has since moved\n"
-        "  - a previous fact said something this new one directly negates\n\n"
+        "  - a previous fact said something this new one directly negates\n"
+        "  - a previous fact recorded \"currently in X\" but this new fact states the user\n"
+        "    previously was in X (and the previous fact is therefore stale)\n\n"
         "Do NOT return facts that are merely related or co-occurring. Only return facts whose\n"
-        "truth value is materially affected by the new fact.\n"
+        "truth value is materially affected by the new fact."
     )
 
 
