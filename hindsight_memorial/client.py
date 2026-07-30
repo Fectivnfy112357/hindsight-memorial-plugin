@@ -185,3 +185,35 @@ class HindsightClient:
             if isinstance(item, dict) and isinstance(item.get("bank_id"), str):
                 ids.append(item["bank_id"])
         return ids
+
+    def list_memory_units(
+        self,
+        bank_id: str,
+        document_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """GET /v1/default/banks/{bank_id}/memories/list?document_id=...
+
+        Used by the webhook handler to pull the freshly retained memory_units for the
+        just-completed document so we can run reconcile per-unit. Pagination is naive:
+        we keep calling until the page comes back smaller than ``limit`` or we hit a
+        hard cap to avoid runaway loops on a misconfigured server.
+        """
+        path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories/list"
+        all_units: list[dict[str, Any]] = []
+        for _ in range(50):  # 50 * 100 = 5000 units ceiling per document
+            resp = self._request(
+                "GET",
+                path,
+                query={"document_id": document_id, "limit": limit, "offset": offset},
+            )
+            page = resp.get("memory_units", []) if isinstance(resp, dict) else []
+            if not isinstance(page, list):
+                page = []
+            all_units.extend(u for u in page if isinstance(u, dict))
+            if len(page) < limit:
+                break
+            offset += limit
+        return all_units

@@ -1,7 +1,8 @@
 # hindsight-memorial
 
-> Client-side pollution cleanup for [Hindsight](https://hindsight.vectorize.io) memories.
-> Runs a reflect LLM call after every `retain` and soft-deletes the facts it has superseded.
+> Webhook-driven pollution cleanup for [Hindsight](https://hindsight.vectorize.io) memories.
+> Receives `retain.completed` events from the Hindsight server and runs a reflect LLM call per
+> retained memory_unit, then soft-deletes any facts it has superseded.
 
 ## Why
 
@@ -12,181 +13,124 @@ from it inherit the staleness, and a future recall returns contradictory facts t
 agent's context.
 
 `hindsight-memorial` is a small standalone toolkit — no third-party Python dependencies, no edits
-to the Hindsight monorepo — that runs **after each `retain`** on the client side and asks a
-reflect LLM call which existing facts the freshly-retained one has superseded, then soft-deletes
-those facts and clears their derived observations.
+to the Hindsight monorepo — that runs as a **webhook receiver** the Hindsight server POSTs to
+after every retain. For each retained memory_unit it asks a reflect LLM call which existing
+facts the freshly-retained one has superseded, then soft-deletes those facts and clears their
+derived observations.
 
 ```
-retain new fact ──► hook intercepts ──► reflect("which old facts did this new one supersede?")
-                                              │
-                                              ▼
-                                    superseded_fact_ids[]
-                                              │
-                  ┌───────────────────────────┼───────────────────────────┐
-                  ▼                           ▼                           ▼
-           PATCH memory {id}      DELETE /memories/{id}/observations    log JSON
-           state=invalidated       (clear derived observations)
+retain new fact
+       │
+       ▼
+Hindsight server commits and indexes
+       │
+       ▼
+POST /webhook/hindsight  (HMAC-SHA256 signed)
+       │
+       ▼
+GET /memories/list?document_id=...     ── pull each memory_unit for this event
+       │
+       ▼
+for each unit:
+   reflect("which old facts did this new unit supersede?")
+       │
+       ▼
+   superseded_fact_ids[]
+       │
+       ├─► PATCH memory {id}     state=invalidated
+       └─► DELETE /memories/{id}/observations
 ```
 
 The reflect call is made while the *new* fact is fresh in context, so the LLM has a clean signal
 to reason from. Once a fact is `state=invalidated` it disappears from `recall` results but remains
 recoverable (`PATCH state=valid` restores it).
 
-## Client support
+Each memory_unit is reconciled independently — facts within the same document are not necessarily
+mutually consistent, so we deliberately avoid fusing them into a single reflect query.
 
-| Client       | Status             | Hook file                  | Tool name the hook matches           |
-|--------------|--------------------|----------------------------|---------------------------------------|
-| Claude Code  | **End-to-end verified** | [`hooks/hooks.json`](hooks/hooks.json) | `mcp__plugin_hindsight-memory_hindsight__agent_knowledge_ingest` |
-| Hermes Agent | **Plugin verified** | [`plugin.yaml`](plugin.yaml) | `hindsight_retain` / `agent_knowledge_ingest` (substring match) |
-| Codex CLI    | Template only — not yet tested on a live Codex | [`hooks/codex.json`](hooks/codex.json) | `^hindsight_retain$` (regex; pending real-name confirmation) |
+## Why webhook, not hooks
+
+Previous versions of this project shipped as Claude Code / Hermes / Codex hooks that intercepted
+retain tool calls. Two unavoidable gaps made that approach unreliable:
+
+1. **Tool-name matchers don't cover all retain paths.** Hindsight's automatic retain (HTTP direct
+   POST + the Stop hook that forces a final write at session end) bypasses any PostToolUse hook.
+   Only actively-invoked `agent_knowledge_ingest` MCP calls were intercepted.
+2. **Hooks fire before the index catches up.** A 30-second initial wait plus two 30-second
+   retries were needed before reflect could see the new fact — and even then, the race was not
+   fully closed.
+
+The webhook path fixes both: the event fires only after Hindsight commits the new fact, and every
+retain path (manual MCP, HTTP direct, Stop-hook forced write) goes through the same
+`retain.completed` event.
 
 ## Install
 
-This project is distributed as a **Claude Code plugin on GitHub**. Anyone can install it without
-cloning anything first.
+### 1. Deploy the receiver alongside your Hindsight server
 
-**Prerequisite**: Claude Code CLI ≥ 1.0 with plugin support.
+This project is a Python package with stdlib-only dependencies. Run it as a long-lived process:
 
 ```bash
-# 1. Register this repo as a marketplace (one-time, per machine)
-/plugin marketplace add Fectivnfy112357/hindsight-memorial-plugin
-
-# 2. Install the plugin
-/plugin install hindsight-memorial@hindsight-memorial
-
-# 3. Reload so the new matcher is picked up (or restart Claude Code)
-/reload-plugins
+git clone https://github.com/Fectivnfy112357/hindsight-memorial-plugin.git
+cd hindsight-memorial-plugin
+python -m hindsight_memorial.webhook_server \
+    --host 0.0.0.0 \
+    --port 9601 \
+    --secret '<same-secret-as-configured-in-hindsight-webhooks-ui>'
 ```
 
-Verify it loaded:
+The receiver listens on `:9601/webhook/hindsight` and `:9601/healthz`.
+
+### 2. Configure the webhook in Hindsight
+
+In the Hindsight UI, add a webhook pointing at the receiver:
+
+- **URL**: `http://<your-host>:9601/webhook/hindsight`
+- **Method**: POST
+- **Signing secret**: any value; paste the same value into `--secret` above
+- **Event type**: `retain.completed`
+- **Enabled**: true
+
+Verify it works:
 
 ```bash
-cat ~/.claude/settings.json | python -c "import sys,json; print(json.load(sys.stdin).get('enabledPlugins'))"
-# should contain: {'hindsight-memorial@hindsight-memorial': True, ...}
+curl http://localhost:9601/healthz
+# → ok
 ```
 
-### Local install (development)
+### 3. Configure the receiver
 
-If you're hacking on the plugin itself and want Claude Code to pick up your local edits:
-
-```bash
-claude plugin marketplace add "D:/programming/projects/hindsight-memorial" --scope user
-claude plugin install hindsight-memorial@hindsight-memorial --scope user
-/reload-plugins
-```
-
-Then edit files under the project directory and re-run `/reload-plugins` to see changes.
-
-### Hermes install
-
-The Hermes integration is a native plugin. Install it once and it fires
-automatically after every `hindsight_retain` call.
-
-**Prerequisite**: Hermes Agent with plugin support.
+Memorial reads connection settings from environment:
 
 ```bash
-# Install directly from GitHub
-hermes plugins install Fectivnfy112357/hindsight-memorial-plugin --enable
-
-# Restart Hermes (or /reset in-session)
-```
-
-Verify it's loaded:
-
-```bash
-hermes plugins list
-# should show: hindsight-memorial  enabled  (plugin)
-```
-
-**What it does under the hood**: the plugin registers a `post_tool_call` hook
-that matches `hindsight_retain` / `agent_knowledge_ingest` tool names. After
-each retain, it calls Hindsight's reflect endpoint to detect superseded facts,
-then soft-deletes them.
-
-**Config**: the plugin reads API credentials from Hermes' own environment
-(`$HERMES_HOME/.env` → `HINDSIGHT_API_URL` / `HINDSIGHT_API_KEY`) and
-bank id from `$HERMES_HOME/hindsight/config.json`.
-
-### Shell hook (alternative, if you prefer config.yaml)
-
-The old shell-hook approach still works. Copy the relevant block from
-[`hooks/hermes.yaml`](hooks/hermes.yaml) into `~/.hermes/config.yaml` under
-the `hooks:` key. The plugin is recommended — it's self-contained and doesn't
-require editing config.yaml.
-
-### Configure
-
-Memorial reads connection settings from `~/.hindsight/claude-code.json` (the same file the official
-Hindsight plugin writes), or from environment variables (which take precedence):
-
-```bash
-# Either: edit ~/.hindsight/claude-code.json
-{
-  "hindsightApiUrl": "http://your-hindsight-host:9600",
-  "hindsightApiToken": "your-token",
-  "directoryBankMap": {
-    "D:/path/to/project-a": "project-a-bank",
-    "D:/path/to/project-b": "project-b-bank"
-  }
-}
-
-# Or: export env vars (override the file)
 export HINDSIGHT_API_URL=http://your-hindsight-host:9600
-export HINDSIGHT_API_KEY=your-token
-export HINDSIGHT_BANK_ID=hindsight
+export HINDSIGHT_API_KEY=your-token        # optional for local
+export HINDSIGHT_WEBHOOK_SECRET=the-secret # must match what Hindsight signed with
 ```
 
-**Bank resolution order** (strict, per directory):
+The bank id is taken from each webhook event's `bank_id` field — there is no project/cwd mapping
+in this mode. A single receiver instance handles every bank on the server.
 
-1. `directoryBankMap[<cwd>]` — exact match after path normalisation
-2. `basename(<cwd>)` — e.g. cwd `D:/code/foo` → bank `foo`
-3. *(give up)* — never auto-create a bank on the server
+### Running in the same container as Hindsight
 
-The hook will silently no-op if the resolved bank does not exist on the server.
-
-### Manual invocation (for testing without a hook)
-
-```bash
-python scripts/retain_reflect_curate.py \
-  --cwd "D:/code/your-project" \
-  --bank-id your-bank \
-  --new-fact "The auth module moved from src/auth/ to src/security/auth/."
-```
-
-With `--dry-run`, it skips the PATCH/DELETE calls and only prints the query the reflect LLM would
-have seen:
-
-```bash
-python scripts/retain_reflect_curate.py --cwd . --bank-id test --new-fact "..." --dry-run
-```
-
-### Hook into Codex (when you're ready)
-
-The hook configs in [`hooks/`](hooks/) are templates. They are **not** wired up automatically;
-they're provided so you can copy the relevant one to the correct location for your client:
-
-- Codex: drop into `~/.codex/hooks.json` (and ensure Codex CLI ≥ v0.124 for stable hook support)
-- Hermes: use the plugin (see install section above) — no manual hook config needed
-
-Tool names on those clients are different from Claude Code's MCP name — see the table at the top
-of this README. For Codex, verify the exact tool name in your client's tool list before activating,
-and update the `matcher` field accordingly.
+If Hindsight and this receiver share a container (recommended), point `HINDSIGHT_API_URL` at
+`http://localhost:9600` (or whatever Hindsight binds internally) and start the receiver as a
+second process inside the same container — e.g. as a second command in your Dockerfile /
+compose file, or supervised by the same init system.
 
 ## Tests
 
 ```bash
-cd hindsight-memorial
-python -m unittest discover -s tests
-# expected: Ran 34 tests in 0.0Xs — OK
+python -m pytest tests/
+# expected: 57 passed in 0.1Xs
 ```
 
-Tests mock the HTTP layer (`urllib.request.urlopen`), so no real Hindsight server is required.
+Tests mock the HTTP layer, so no real Hindsight server is required.
 
 ## What's *not* in scope
 
 - **Hard-deleting facts.** Memorial only soft-deletes (`state=invalidated`). Reversible.
-- **Scheduled background scanning.** Memorial runs synchronously at retain time.
-- **Cross-client deduplication.** Each client invokes its own hook; nothing coordinates across them.
+- **Scheduled background scanning.** Memorial reacts to retain events only.
 - **Modifying the Hindsight monorepo.** Memorial is fully standalone and only uses the public
   HTTP API.
 
@@ -194,40 +138,38 @@ Tests mock the HTTP layer (`urllib.request.urlopen`), so no real Hindsight serve
 
 - The reflect LLM is asked about *supersession*, not general cleanup, to keep false positives low.
   Failures are isolated per-id in `curate_many`, so one bad id doesn't abort the rest.
-- The hook is non-fatal by design: any failure (reflect / patch / delete / network) is logged and
-  exit code is always 0, so memorial never blocks the calling agent.
+- Reflect failures are surfaced as `status="reflect_failed"` and acknowledged with HTTP 200.
+  Hindsight's outbox has a 5s/5min/30min/2h/5h retry policy; a webhook receiver that returns 5xx
+  would trigger that storm. Returning 200 with a structured failure in the body keeps the outbox
+  quiescent.
 - Reversibility: `PATCH /v1/default/banks/{bank_id}/memories/{id} {state: "valid"}` restores an
-  invalidated fact. The `reason` field set by memorial (visible via `GET /memories/{id}`) makes it
-  auditable why each fact was invalidated.
-- Hook payload parsing accepts four shapes (top-level fields, nested `tool_input.*`, `memory.*`,
-  and Codex-style `tool_input.command="hindsight retain '...'"`). Adding a new client shape is a
-  3-line addition in `scripts/retain_reflect_curate.py:_extract_new_fact`.
+  invalidated fact. The `reason` field set by memorial (visible via `GET /memories/{id}`) makes
+  it auditable why each fact was invalidated.
+- Per-unit reconcile (rather than fusing all units of a document into one reflect query) is
+  deliberate: facts in the same document can be mutually contradictory, and the reflect LLM
+  performs better when asked about one new fact at a time.
 
 ## Project layout
 
 ```
 hindsight-memorial/
-├── .claude-plugin/
-│   ├── plugin.json          ← Claude Code plugin manifest
-│   └── marketplace.json     ← self-host marketplace (so `claude plugin marketplace add <path>` works)
-├── plugin.yaml            ← Hermes plugin manifest (repo root)
-├── __init__.py            ← Hermes plugin entry point (register(ctx) → post_tool_call hook)
-├── hindsight_memorial/      ← shared Python package (imported by both Claude Code and Hermes)
-│   ├── __init__.py
-│   ├── client.py            ← stdlib HTTP client (4 Hindsight endpoints)
-│   ├── config.py            ← config loading (env + ~/.hindsight/*.json)
-│   ├── curate.py            ← soft-delete + observation-clear
-│   └── reflect_query.py     ← structured supersession query
-├── hooks/
-│   ├── hooks.json           ← ACTIVE: Claude Code PostToolUse hook
-│   ├── codex.json           ← template: Codex CLI hook config
-│   └── hermes.yaml          ← reference: Hermes shell hook (plugin is preferred)
-├── scripts/
-│   ├── lib/                 ← backward-compat re-exports of hindsight_memorial
-│   └── retain_reflect_curate.py        ← main entry point (run by hooks)
-├── skills/hindsight-memorial/SKILL.md  ← plugin skill (auto-loaded into Claude Code sessions)
-├── tests/                              ← 34 unit tests (stdlib only)
-├── SKILL.md, README.md, pyproject.toml, .gitignore
+├── hindsight_memorial/                 ← Python package (stdlib-only)
+│   ├── __init__.py                     ← public API surface
+│   ├── client.py                       ← stdlib HTTP client (Hindsight API)
+│   ├── config.py                       ← MemorialConfig dataclass + env loading
+│   ├── curate.py                       ← soft-delete + observation-clear
+│   ├── reconcile.py                    ← single-attempt reflect + curate pipeline
+│   ├── reflect_query.py                ← structured supersession query builder
+│   ├── webhook_handlers.py             ← verify_signature + parse_event + handle_event
+│   └── webhook_server.py               ← `python -m` HTTP entrypoint
+├── tests/                              ← 57 unit tests (stdlib only)
+│   ├── test_client.py
+│   ├── test_config.py
+│   ├── test_curate.py
+│   ├── test_reconcile.py
+│   ├── test_reflect_query.py
+│   └── test_webhook_handlers.py
+├── SKILL.md, README.md, pyproject.toml, conftest.py
 ```
 
 ## License

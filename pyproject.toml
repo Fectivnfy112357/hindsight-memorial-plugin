@@ -5,20 +5,24 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hindsight-memorial"
 version = "0.1.0"
-description = "Client-side pollution cleanup for Hindsight memories across Claude Code / Codex / Hermes."
+description = "Webhook-driven pollution cleanup for Hindsight memories. Receives retain.completed events and runs a per-memory_unit reflect + curate pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+# Stdlib-only by design — no third-party deps. The webhook server uses
+# http.server.ThreadingHTTPServer, the HTTP client uses urllib, HMAC uses hashlib.
 dependencies = []
 authors = [{ name = "贾晓源" }]
-keywords = ["hindsight", "memory", "agent", "cleanup", "pollution"]
+keywords = ["hindsight", "memory", "agent", "cleanup", "pollution", "webhook"]
 
-# NOTE: this project is consumed as a Claude Code plugin (drop the directory into a
-# marketplace or run `claude plugin install`). The Python modules under scripts/lib are
-# imported by scripts/retain_reflect_curate.py at runtime via `sys.path` manipulation
-# (see scripts/retain_reflect_curate.py), NOT as an installed package. So we deliberately
-# omit `[tool.setuptools.packages.find]` and the `[project.scripts]` entry: there is no
-# installable wheel. `pip install` is not required, and `pip install -e .` is a no-op.
+[project.scripts]
+# Lets users run `hindsight-memorial-webhook --port 9601 --secret ...`
+# after `pip install .`.
+hindsight-memorial-webhook = "hindsight_memorial.webhook_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hindsight_memorial*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

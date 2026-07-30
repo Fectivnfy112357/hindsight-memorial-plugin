@@ -1,9 +1,7 @@
-"""Pytest config: ensure the project root is on sys.path so that
-``plugins.hermes`` / ``plugins.claude_code`` resolve during test collection.
-"""
-import sys
-from pathlib import Path
+"""Pytest config: nothing project-specific needed today.
 
-_PROJECT_ROOT = Path(__file__).resolve().parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+The package is importable as ``hindsight_memorial`` once pytest's rootdir is
+set (see ``pyproject.toml [tool.pytest.ini_options] testpaths``), so no
+``sys.path`` injection is required. Kept as a placeholder in case future
+fixtures want a ``conftest.py``-scoped setup.
+"""

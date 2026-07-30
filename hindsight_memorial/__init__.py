@@ -13,6 +13,16 @@ from .reflect_query import (
     build_query,
     extract_superseded_ids,
 )
+from .webhook_handlers import (
+    EVENT_HEADER,
+    RetainEvent,
+    SIGNATURE_HEADER,
+    WebhookOutcome,
+    handle_event,
+    parse_event,
+    verify_signature,
+    webhook_config_loader,
+)
 
 __all__ = [
     "HindsightAPIError",
@@ -30,4 +40,13 @@ __all__ = [
     "SUPERSEDED_SCHEMA",
     "build_query",
     "extract_superseded_ids",
+    # webhook
+    "EVENT_HEADER",
+    "RetainEvent",
+    "SIGNATURE_HEADER",
+    "WebhookOutcome",
+    "handle_event",
+    "parse_event",
+    "verify_signature",
+    "webhook_config_loader",
 ]
