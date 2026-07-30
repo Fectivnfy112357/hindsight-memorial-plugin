@@ -1,15 +1,22 @@
 """Hermes plugin entry point for hindsight-memorial.
 
-This package is the only Hermes-specific surface in the project; everything
-else lives in ``hindsight_memorial/``. This file does three things and no more:
+This file is the Hermes entrypoint. It defines ``register(ctx)`` which is
+called by ``hermes_plugins`` when the plugin is discovered at
+``~/.hermes/plugins/hindsight-memorial/__init__.py``.
 
-  1. Detect whether a tool call is a Hindsight retain.
-  2. Pull the new fact out of the call's args.
-  3. Hand it off to ``hindsight_memorial.reconcile.run_reconcile`` with a
-     Hermes-shaped config loader from ``plugins.hermes.config``.
+Layout:
 
-Bank-id resolution, retry policy, query building, and curate all live in the
-shared library.
+* ``__init__.py``              ← this file. Hermes entrypoint.
+* ``hermes_config.py``         ← Hermes-specific bank-id resolution.
+* ``hindsight_memorial/``      ← shared backend (client, config, reconcile, …)
+* ``plugins/claude_code/cli.py`` ← CLI entry used by ``scripts/retain_reflect_curate.py``
+* ``scripts/``                 ← compatibility shim for Claude Code hooks
+* ``tests/``                   ← pytest suite
+
+The two adapters (this file for Hermes, ``plugins/claude_code/cli.py`` for
+Claude Code) each only know their own config-discovery rules and call into
+the shared ``hindsight_memorial.reconcile.run_reconcile`` pipeline so the
+retry policy, query building, and curate all live in exactly one place.
 """
 from __future__ import annotations
 
@@ -19,7 +26,7 @@ from typing import Any
 
 from hindsight_memorial.reconcile import run_reconcile
 
-from .config import build_loader, read_config
+from hermes_config import build_loader, read_config
 
 log = logging.getLogger("hindsight_memorial.hermes")
 

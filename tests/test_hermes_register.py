@@ -1,8 +1,8 @@
-"""Regression tests for the Hermes plugin adapter (``plugins.hermes``).
+"""Regression tests for the Hermes plugin adapter.
 
 These tests cover (a) bank-id resolution rules under ``HERMES_HOME`` and
-(b) that :func:`plugins.hermes.register` registers a ``post_tool_call`` hook
-pointing at the right callback.
+(b) that :func:`register` (the project root's plugin entry) registers a
+``post_tool_call`` hook pointing at the right callback.
 """
 from __future__ import annotations
 
@@ -14,12 +14,26 @@ from pathlib import Path
 from unittest import mock
 
 from hindsight_memorial.config import MemorialConfig
-from plugins.hermes import register
-from plugins.hermes.config import (
+
+# The Hermes plugin entrypoint lives at the project root so that
+# `~/.hermes/plugins/hindsight-memorial/__init__.py` resolves as a
+# standalone spec when Hermes loads plugins.
+import hermes_config
+from hermes_config import (
     build_loader,
     load_hermes_config,
     read_config,
 )
+
+import importlib.util
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location(
+    "hermes_plugin_entry", _PROJECT_ROOT / "__init__.py"
+)
+_hermes_plugin = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_hermes_plugin)
+register = _hermes_plugin.register
 
 
 def _write_hermes_config(home: Path, data: dict) -> None:
