@@ -122,11 +122,13 @@ def run_reconcile(
     try:
         client = HindsightClient.from_memorial_config(cfg)
     except Exception as e:  # pragma: no cover - depends on env
+        log.error("client init failed bank=%s: %s", cfg.bank_id, e)
         return ReconcileResult(status="error", error=f"client init failed: {e}")
 
     try:
         bank_ids = client.list_banks()
     except HindsightAPIError as e:
+        log.warning("list_banks failed bank=%s: %s", cfg.bank_id, e)
         return ReconcileResult(
             status="list_banks_failed",
             error=str(e),
@@ -135,6 +137,12 @@ def run_reconcile(
         )
 
     if cfg.bank_id not in bank_ids:
+        log.info(
+            "bank '%s' not present on server (resolved via %s, %d available)",
+            cfg.bank_id,
+            cfg.bank_source,
+            len(bank_ids),
+        )
         return ReconcileResult(
             status="skipped",
             reason=(

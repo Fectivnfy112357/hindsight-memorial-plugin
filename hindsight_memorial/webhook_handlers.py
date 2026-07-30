@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import json
 import logging
+import logging.handlers
 import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
@@ -36,6 +37,53 @@ log = logging.getLogger("hindsight_memorial.webhook_handlers")
 # Header literal from hindsight-api-slim/hindsight_api/engine/memory_engine.py:2322-2328
 SIGNATURE_HEADER = "X-Hindsight-Signature"
 EVENT_HEADER = "X-Hindsight-Event"
+
+# ── logging setup ────────────────────────────────────────────────────────
+
+
+def configure_logging(
+    log_file: str | None = None,
+    level: str | None = None,
+) -> None:
+    """Configure the ``hindsight_memorial`` logger tree.
+
+    Honours env vars when args are not given:
+
+      HINDSIGHT_MEMORIAL_LOG_FILE  path to a rotating file; if unset, stderr only
+      HINDSIGHT_MEMORIAL_LOG_LEVEL  one of DEBUG/INFO/WARNING/ERROR (default INFO)
+
+    RotatingFileHandler: 10 MB per file, 5 backups. Idempotent — safe to call
+    multiple times (e.g. from tests).
+    """
+    resolved_level = (level or os.environ.get("HINDSIGHT_MEMORIAL_LOG_LEVEL") or "INFO").upper()
+    resolved_file = log_file or os.environ.get("HINDSIGHT_MEMORIAL_LOG_FILE") or None
+
+    root = logging.getLogger("hindsight_memorial")
+    root.setLevel(getattr(logging, resolved_level, logging.INFO))
+    # Wipe handlers added by previous configure_logging calls.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
+
+    if resolved_file:
+        os.makedirs(os.path.dirname(resolved_file), exist_ok=True)
+        rotating = logging.handlers.RotatingFileHandler(
+            resolved_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        rotating.setFormatter(fmt)
+        root.addHandler(rotating)
+        root.info("logging to file: %s", resolved_file)
 
 
 # ── payload model ────────────────────────────────────────────────────────
@@ -196,7 +244,15 @@ def handle_event(
         elif lk == EVENT_HEADER.lower():
             event_name = v
 
+    log.info(
+        "webhook received: bytes=%d event_header=%r sig_present=%s",
+        len(raw_body),
+        event_name,
+        bool(sig),
+    )
+
     if not verify_signature(raw_body, sig, secret):
+        log.warning("signature verification failed (event=%r)", event_name)
         return WebhookOutcome(
             status="ignored",
             error="signature verification failed",
@@ -204,6 +260,10 @@ def handle_event(
 
     evt = parse_event(raw_body)
     if evt is None:
+        log.warning(
+            "payload rejected: not a retain.completed event (event_header=%r)",
+            event_name,
+        )
         return WebhookOutcome(
             status="ignored",
             error=(
@@ -211,7 +271,20 @@ def handle_event(
             ),
         )
 
+    log.info(
+        "event parsed: bank=%s document=%s memory_unit_count=%d operation=%s",
+        evt.bank_id,
+        evt.document_id,
+        evt.memory_unit_count,
+        evt.operation_id,
+    )
+
     if evt.memory_unit_count == 0:
+        log.info(
+            "skipped: zero-fact batch bank=%s document=%s",
+            evt.bank_id,
+            evt.document_id,
+        )
         return WebhookOutcome(
             status="skipped",
             bank_id=evt.bank_id,
@@ -221,7 +294,18 @@ def handle_event(
         )
 
     units = fetch_units(evt.bank_id, evt.document_id)
+    log.info(
+        "fetched units: bank=%s document=%s units=%d",
+        evt.bank_id,
+        evt.document_id,
+        len(units),
+    )
     if not units:
+        log.info(
+            "skipped: /memories/list returned 0 units bank=%s document=%s",
+            evt.bank_id,
+            evt.document_id,
+        )
         return WebhookOutcome(
             status="skipped",
             bank_id=evt.bank_id,
@@ -233,9 +317,18 @@ def handle_event(
 
     loader = webhook_config_loader(evt.bank_id)
     per_unit: list[ReconcileResult] = []
-    for unit in units:
+    for idx, unit in enumerate(units, start=1):
         text = unit.get("text") if isinstance(unit, dict) else None
+        unit_id = unit.get("id") if isinstance(unit, dict) else None
         if not isinstance(text, str) or not text.strip():
+            log.info(
+                "unit %d/%d skipped (no text) bank=%s document=%s unit_id=%s",
+                idx,
+                len(units),
+                evt.bank_id,
+                evt.document_id,
+                unit_id,
+            )
             per_unit.append(
                 ReconcileResult(
                     status="skipped",
@@ -245,7 +338,25 @@ def handle_event(
                 )
             )
             continue
+        log.info(
+            "unit %d/%d reconciling bank=%s document=%s unit_id=%s text_preview=%r",
+            idx,
+            len(units),
+            evt.bank_id,
+            evt.document_id,
+            unit_id,
+            text.strip()[:120],
+        )
         result = run_reconcile(text.strip(), load_cfg=loader)
+        log.info(
+            "unit %d/%d result=%s superseded=%d observations_cleared=%d error=%s",
+            idx,
+            len(units),
+            result.status,
+            result.superseded_count,
+            result.observations_cleared,
+            result.error,
+        )
         per_unit.append(result)
 
     return _aggregate(evt, per_unit)

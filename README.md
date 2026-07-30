@@ -64,59 +64,124 @@ The webhook path fixes both: the event fires only after Hindsight commits the ne
 retain path (manual MCP, HTTP direct, Stop-hook forced write) goes through the same
 `retain.completed` event.
 
-## Install
+## Deploy
 
-### 1. Deploy the receiver alongside your Hindsight server
+The receiver runs as a standalone Docker container alongside the Hindsight
+server. It does not modify the Hindsight deployment in any way — they are
+two independent projects that share one docker network.
 
-This project is a Python package with stdlib-only dependencies. Run it as a long-lived process:
+### Project layout
 
-```bash
-git clone https://github.com/Fectivnfy112357/hindsight-memorial-plugin.git
-cd hindsight-memorial-plugin
-python -m hindsight_memorial.webhook_server \
-    --host 0.0.0.0 \
-    --port 9601 \
-    --secret '<same-secret-as-configured-in-hindsight-webhooks-ui>'
+```
+hindsight-memorial/
+├── Dockerfile                       ← image build (python:3.13-slim + stdlib only)
+├── docker-compose.yml               ← service definition, joins hindsight_default network
+├── .env.example                     ← copy to .env on the host
+├── app/                             ← Python source tree, bind-mounted
+│   └── hindsight_memorial/
+├── data/logs/                       ← bind-mounted log directory
+│   └── hindsight-memorial.log       ← RotatingFileHandler, 10 MB × 5 backups
+├── tests/
+├── README.md
+└── SKILL.md
 ```
 
-The receiver listens on `:9601/webhook/hindsight` and `:9601/healthz`.
+The Hindsight project lives in a separate sibling directory (typically
+`/www/dk_project/dk_app/hindsight/`) and is **never touched by this repo**.
 
-### 2. Configure the webhook in Hindsight
+### 1. Place the source on the deployment host
 
-In the Hindsight UI, add a webhook pointing at the receiver:
+```bash
+# From your dev machine:
+tar czf /tmp/hindsight-memorial.tar.gz \
+    --exclude='.git' --exclude='.venv' --exclude='__pycache__' \
+    --exclude='.pytest_cache' --exclude='.idea' .
+scp /tmp/hindsight-memorial.tar.gz user@host:/www/dk_project/dk_app/
 
-- **URL**: `http://<your-host>:9601/webhook/hindsight`
+ssh user@host
+cd /www/dk_project/dk_app
+mkdir -p hindsight-memorial/app hindsight-memorial/data/logs
+tar xzf hindsight-memorial.tar.gz -C hindsight-memorial/app --strip-components=0
+```
+
+### 2. Configure secrets
+
+```bash
+cd /www/dk_project/dk_app/hindsight-memorial
+cp .env.example .env
+# Edit .env — set HINDSIGHT_API_KEY to the same value the Hindsight container uses
+# (see /www/dk_project/dk_app/hindsight/.env) and set HINDSIGHT_WEBHOOK_SECRET to
+# the output of: openssl rand -hex 32
+```
+
+### 3. Build and start
+
+```bash
+docker compose up -d --build
+docker compose logs -f memorial
+# → "hindsight-memorial webhook server listening on 0.0.0.0:9602"
+```
+
+### 4. Verify
+
+```bash
+docker compose ps              # memorial should be (healthy)
+docker compose logs --tail 50  # check for "listening on" + no error lines
+```
+
+### 5. Wire up the webhook in Hindsight
+
+In the Hindsight webhooks UI:
+
+- **URL**: `http://memorial:9602/webhook/hindsight` (the docker network hostname,
+  NOT `localhost` or the host IP — the Hindsight container reaches the memorial
+  container over the shared `hindsight_default` network)
 - **Method**: POST
-- **Signing secret**: any value; paste the same value into `--secret` above
+- **Signing secret**: paste the same value you put in `HINDSIGHT_WEBHOOK_SECRET`
 - **Event type**: `retain.completed`
 - **Enabled**: true
 
-Verify it works:
+Trigger a retain and watch the log:
 
 ```bash
-curl http://localhost:9601/healthz
-# → ok
+tail -f data/logs/hindsight-memorial.log
+# Expect lines like:
+#   webhook received: bytes=412 event_header='retain.completed' sig_present=True
+#   event parsed: bank=... document=... memory_unit_count=1 operation=...
+#   unit 1/1 reconciling bank=... document=... text_preview='...'
+#   unit 1/1 result=ok superseded=2 observations_cleared=4 error=None
+#   webhook processed: status=ok bank=... document=... units=1 superseded=2
 ```
 
-### 3. Configure the receiver
+### Network configuration
 
-Memorial reads connection settings from environment:
+The compose file declares an **external** network:
+
+```yaml
+networks:
+  hindsight_net:
+    external: true
+    name: hindsight_default
+```
+
+This joins the existing network that the Hindsight project created (docker
+compose names networks `<project>_default`). The memorial service can resolve
+`hindsight` because both containers share this network. **No host port is
+exposed** — the receiver is only reachable from inside the docker network.
+
+If the Hindsight project was deployed under a different compose project name,
+update `name:` above to match `<that-name>_default`.
+
+### Upgrading
 
 ```bash
-export HINDSIGHT_API_URL=http://your-hindsight-host:9600
-export HINDSIGHT_API_KEY=your-token        # optional for local
-export HINDSIGHT_WEBHOOK_SECRET=the-secret # must match what Hindsight signed with
+cd /www/dk_project/dk_app/hindsight-memorial
+# Re-upload the new source to ./app/ (via tar+scp as in step 1)
+docker compose restart memorial   # no rebuild needed (source is bind-mounted)
 ```
 
-The bank id is taken from each webhook event's `bank_id` field — there is no project/cwd mapping
-in this mode. A single receiver instance handles every bank on the server.
-
-### Running in the same container as Hindsight
-
-If Hindsight and this receiver share a container (recommended), point `HINDSIGHT_API_URL` at
-`http://localhost:9600` (or whatever Hindsight binds internally) and start the receiver as a
-second process inside the same container — e.g. as a second command in your Dockerfile /
-compose file, or supervised by the same init system.
+`docker compose restart` re-execs the process without rebuilding the image.
+Image rebuilds are only needed when `Dockerfile` itself changes.
 
 ## Tests
 
@@ -153,23 +218,31 @@ Tests mock the HTTP layer, so no real Hindsight server is required.
 
 ```
 hindsight-memorial/
-├── hindsight_memorial/                 ← Python package (stdlib-only)
-│   ├── __init__.py                     ← public API surface
-│   ├── client.py                       ← stdlib HTTP client (Hindsight API)
-│   ├── config.py                       ← MemorialConfig dataclass + env loading
-│   ├── curate.py                       ← soft-delete + observation-clear
-│   ├── reconcile.py                    ← single-attempt reflect + curate pipeline
-│   ├── reflect_query.py                ← structured supersession query builder
-│   ├── webhook_handlers.py             ← verify_signature + parse_event + handle_event
-│   └── webhook_server.py               ← `python -m` HTTP entrypoint
-├── tests/                              ← 57 unit tests (stdlib only)
+├── Dockerfile                       ← image build (python:3.13-slim)
+├── docker-compose.yml               ← joins hindsight_default docker network
+├── .env.example                     ← deployment secret template (copy → .env)
+├── .gitignore
+├── app/                             ← Python source tree (bind-mounted into container)
+│   └── hindsight_memorial/
+│       ├── __init__.py              ← public API surface
+│       ├── client.py                ← stdlib HTTP client (Hindsight API)
+│       ├── config.py                ← MemorialConfig dataclass + env loading
+│       ├── curate.py                ← soft-delete + observation-clear
+│       ├── reconcile.py             ← single-attempt reflect + curate pipeline
+│       ├── reflect_query.py         ← structured supersession query builder
+│       ├── webhook_handlers.py      ← verify_signature + parse_event + handle_event
+│       └── webhook_server.py        ← `python -m` HTTP entrypoint
+├── data/                            ← bind-mounted log directory (gitignored)
+│   └── logs/
+│       └── hindsight-memorial.log   ← RotatingFileHandler output
+├── tests/                           ← 57 unit tests (stdlib only)
 │   ├── test_client.py
 │   ├── test_config.py
 │   ├── test_curate.py
 │   ├── test_reconcile.py
 │   ├── test_reflect_query.py
 │   └── test_webhook_handlers.py
-├── SKILL.md, README.md, pyproject.toml, conftest.py
+└── SKILL.md, README.md, pyproject.toml, conftest.py
 ```
 
 ## License

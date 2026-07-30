@@ -7,11 +7,14 @@ concurrent webhooks do not serialize.
 Run::
 
     python -m hindsight_memorial.webhook_server \
-        --host 0.0.0.0 --port 9601 \
+        --host 0.0.0.0 --port 9602 \
         --secret <hex-encoded-shared-secret>
 
 The secret is read from ``--secret`` or ``HINDSIGHT_WEBHOOK_SECRET`` (the env
 var wins). It must match the secret configured in the Hindsight webhooks UI.
+
+Logs go to stderr AND, when ``HINDSIGHT_MEMORIAL_LOG_FILE`` is set, a rotating
+file at that path. See :func:`hindsight_memorial.webhook_handlers.configure_logging`.
 """
 from __future__ import annotations
 
@@ -24,11 +27,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .client import HindsightClient
-from .webhook_handlers import handle_event
+from .webhook_handlers import configure_logging, handle_event
 
 log = logging.getLogger("hindsight_memorial.webhook_server")
 
-DEFAULT_PORT = 9601
+DEFAULT_PORT = 9602
 
 
 def _resolve_secret(arg: str | None) -> bytes:
@@ -59,6 +62,12 @@ def _make_handler(secret: bytes):
             def fetch_units(bank_id: str, document_id: str):
                 api_url = os.environ.get("HINDSIGHT_API_URL", "").strip()
                 if not api_url:
+                    log.warning(
+                        "fetch_units called but HINDSIGHT_API_URL is unset "
+                        "(bank=%s document=%s)",
+                        bank_id,
+                        document_id,
+                    )
                     return []
                 client = HindsightClient(
                     base_url=api_url.rstrip("/"),
@@ -71,12 +80,13 @@ def _make_handler(secret: bytes):
             )
             log.info(
                 "webhook processed: status=%s bank=%s document=%s "
-                "units=%d superseded=%d",
+                "units=%d superseded=%d observations_cleared=%d",
                 outcome.status,
                 outcome.bank_id,
                 outcome.document_id,
                 outcome.units_processed,
                 outcome.total_superseded,
+                outcome.total_observations_cleared,
             )
             # 200 for every well-formed-but-rejected request (bad signature,
             # non-retain event, empty doc) so Hindsight's outbox doesn't enter
@@ -126,10 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(level=args.log_level)
     serve(args.host, args.port, _resolve_secret(args.secret))
     return 0
 

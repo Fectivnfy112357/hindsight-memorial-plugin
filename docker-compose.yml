@@ -1,0 +1,56 @@
+# docker-compose.yml — webhook receiver for hindsight-memorial.
+#
+# This file is the deployment manifest for the *memorial* container only. The
+# Hindsight server itself runs in a sibling project directory (e.g.
+# /www/dk_project/dk_app/hindsight/) under its own docker-compose.yml and is
+# NEVER modified by this repo.
+#
+# Networking: this service joins the existing hindsight_default network so
+# it can resolve the host name "hindsight" and reach the Hindsight API at
+# http://hindsight:8888 (the container-internal port, NOT the 9600 host port).
+#
+# Logs: bind-mount ./data/logs so log files land in the project directory and
+# survive container restarts. RotatingFileHandler inside the app keeps each
+# file under 10 MB and retains 5 backups.
+
+services:
+  memorial:
+    build:
+      context: .
+      # The source tree is mounted read-only at /app; the image only carries
+      # the Python runtime. Override MEMORIAL_PORT here if you change the
+      # EXPOSE in Dockerfile.
+      args:
+        MEMORIAL_PORT: "9602"
+    image: hindsight-memorial:local
+    container_name: hindsight-memorial
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Internal address — the host:9600 mapping is only for browsers /
+      # external clients; inside the docker network we use the container name.
+      HINDSIGHT_API_URL: "http://hindsight:8888"
+      HINDSIGHT_MEMORIAL_LOG_FILE: "/data/logs/hindsight-memorial.log"
+      HINDSIGHT_MEMORIAL_LOG_LEVEL: "INFO"
+      MEMORIAL_PORT: "9602"
+    volumes:
+      # Source — bind-mount so code changes don't require a rebuild.
+      # :ro would be safer in production but blocks `pip install -e .` if you
+      # ever need it; here we use :rw to keep the door open.
+      - ./app:/app
+      # Logs — see comment at top of file.
+      - ./data/logs:/data/logs
+    networks:
+      - hindsight_net
+    # No `ports:` — the receiver is reached only via the docker network from
+    # the hindsight container. If you need to debug locally:
+    #   docker compose run --service-ports memorial  (then localhost:9602)
+
+networks:
+  hindsight_net:
+    # Join the existing network created by the hindsight project so we can
+    # resolve the `hindsight` host name. The name below must match the
+    # compose project name + "_default" of the hindsight project. If you
+    # renamed that project, update `name:` accordingly.
+    external: true
+    name: hindsight_default

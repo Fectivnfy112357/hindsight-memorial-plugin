@@ -27,3 +27,11 @@ Thumbs.db
 *.log
 .coverage
 htmlcov/
+
+# Deployment secrets — never commit the real .env file.
+.env
+.env.local
+.env.*.local
+
+# Deployment data — bind-mounted into the memorial container; never committed.
+data/
