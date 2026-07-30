@@ -186,6 +186,30 @@ class HindsightClient:
                 ids.append(item["bank_id"])
         return ids
 
+    def list_recent_units(
+        self,
+        bank_id: str,
+        *,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """GET /v1/default/banks/{bank_id}/memories/list — most recent N units.
+
+        Used as a fallback when the webhook payload omits ``data.document_id``
+        (a Hindsight client-side bug observed in some retain paths: the server
+        generates a document_id but never writes it back into the content
+        dict that flows into the webhook). We pull the most recently mentioned
+        memory_units and read their ``document_id`` field to recover the doc
+        the webhook was actually notifying about.
+
+        Sorted by mentioned_at DESC NULLS LAST, created_at DESC (server default).
+        """
+        path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories/list"
+        resp = self._request("GET", path, query={"limit": limit})
+        page = resp.get("items", []) if isinstance(resp, dict) else []
+        if not isinstance(page, list):
+            return []
+        return [u for u in page if isinstance(u, dict)]
+
     def list_memory_units(
         self,
         bank_id: str,

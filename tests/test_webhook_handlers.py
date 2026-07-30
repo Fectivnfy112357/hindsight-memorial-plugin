@@ -87,11 +87,17 @@ class ParseEventTest(unittest.TestCase):
         body = _retain_event(event="consolidation.completed")
         self.assertIsNone(wh.parse_event(body))
 
-    def test_ignores_missing_document_id(self):
+    def test_returns_event_with_none_document_id_when_missing(self):
+        # Missing document_id is no longer a rejection — callers must fall back
+        # to list_recent_units (see Hindsight bug at orchestrator.py:757).
         body = json.dumps(
             {"event": "retain.completed", "bank_id": "b", "data": {"memory_unit_count": 1}}
         ).encode()
-        self.assertIsNone(wh.parse_event(body))
+        evt = wh.parse_event(body)
+        self.assertIsNotNone(evt)
+        assert evt is not None
+        self.assertIsNone(evt.document_id)
+        self.assertEqual(evt.bank_id, "b")
 
     def test_ignores_non_json(self):
         self.assertIsNone(wh.parse_event(b"not json"))
@@ -277,6 +283,103 @@ class HandleEventTest(unittest.TestCase):
         # All units skipped at the reconcile layer; aggregate status = abandoned.
         self.assertIn(outcome.status, {"abandoned", "skipped"})
         self.assertEqual(outcome.units_processed, 0)
+
+    # ── fallback: data={} (no document_id) → recover from recent units ──
+
+    def _run_with_fallback(self, body, units, recent_units, fetch_recent_returns=None):
+        """Drive handle_event with both fetch_units and fetch_recent_doc stubs."""
+        if fetch_recent_returns is None:
+            # By default, fetch_recent_doc returns the document_id of the first
+            # recent unit that has one.
+            def fetch_recent_doc(bank_id: str) -> str | None:
+                for u in recent_units:
+                    did = u.get("document_id")
+                    if isinstance(did, str) and did:
+                        return did
+                return None
+        else:
+            fetch_recent_doc = fetch_recent_returns
+        return wh.handle_event(
+            body,
+            self._headers(body),
+            secret=SECRET,
+            fetch_units=lambda b, d: units,
+            fetch_recent_doc=fetch_recent_doc,
+        )
+
+    def test_data_empty_falls_back_to_recent_doc_id(self):
+        # Rewrite payload to simulate Hindsight's bug: data={}.
+        body_dict = {
+            "event": "retain.completed",
+            "bank_id": "hindsight-memorial",
+            "operation_id": "op-x",
+            "data": {},
+        }
+        empty_body = json.dumps(body_dict).encode()
+        recent = [{"id": "u-recent", "document_id": "recovered-doc", "text": "x"}]
+        units = [{"id": "u-recent", "text": "the recovered fact"}]
+
+        fake_client = mock.MagicMock()
+        fake_client.list_banks.return_value = ["hindsight-memorial"]
+        fake_client.reflect.return_value = {
+            "structured_output": {"superseded_fact_ids": [], "reasoning": "none"}
+        }
+
+        with mock.patch.dict(
+            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
+        ), mock.patch(
+            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
+            return_value=fake_client,
+        ):
+            outcome = self._run_with_fallback(empty_body, units, recent)
+
+        # The fallback recovered the document_id; reconcile ran normally.
+        self.assertEqual(outcome.status, "abandoned")  # 0 superseded is "abandoned"
+        self.assertEqual(outcome.document_id, "recovered-doc")
+        self.assertEqual(outcome.units_processed, 1)
+
+    def test_data_empty_with_no_recent_fallback_returns_skipped(self):
+        body_dict = {
+            "event": "retain.completed",
+            "bank_id": "hindsight-memorial",
+            "operation_id": "op-x",
+            "data": {},
+        }
+        empty_body = json.dumps(body_dict).encode()
+        # fetch_recent_doc returns None → no doc_id recoverable.
+        outcome = self._run_with_fallback(
+            empty_body, units=[], recent_units=[], fetch_recent_returns=lambda b: None
+        )
+        self.assertEqual(outcome.status, "skipped")
+        self.assertEqual(outcome.units_processed, 0)
+        self.assertEqual(outcome.units_skipped, 0)
+
+    def test_data_with_doc_id_skips_fallback(self):
+        """If the webhook already carries a document_id, fetch_recent_doc must
+        NOT be called (no needless Hindsight load)."""
+        body = _retain_event(memory_unit_count=1)
+        units = [{"id": "u1", "text": "normal flow"}]
+
+        recent_called = {"n": 0}
+
+        def fetch_recent_doc(bank_id):
+            recent_called["n"] += 1
+            return "should-not-be-used"
+
+        fake_client = mock.MagicMock()
+        fake_client.list_banks.return_value = ["hindsight-memorial"]
+        fake_client.reflect.return_value = {
+            "structured_output": {"superseded_fact_ids": [], "reasoning": ""}
+        }
+        with mock.patch.dict(
+            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
+        ), mock.patch(
+            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
+            return_value=fake_client,
+        ):
+            outcome = self._run_with_fallback(body, units, [], fetch_recent_doc)
+        self.assertEqual(recent_called["n"], 0)
+        self.assertEqual(outcome.document_id, "doc-abc")
 
 
 class WebhookConfigLoaderTest(unittest.TestCase):

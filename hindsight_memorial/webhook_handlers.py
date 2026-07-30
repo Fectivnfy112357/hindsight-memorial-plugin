@@ -91,12 +91,18 @@ def configure_logging(
 
 @dataclass
 class RetainEvent:
-    """Parsed retain.completed webhook event."""
+    """Parsed retain.completed webhook event.
+
+    ``document_id`` may be None: some Hindsight retain paths emit
+    ``data={}`` because the client did not supply a document_id and the
+    server's auto-generated id is not propagated into the webhook payload.
+    Callers can fall back to ``list_recent_units`` in that case.
+    """
 
     event: str
     bank_id: str
     operation_id: str | None
-    document_id: str
+    document_id: str | None
     memory_unit_count: int
 
 
@@ -155,6 +161,12 @@ def parse_event(raw_body: bytes) -> RetainEvent | None:
           "timestamp":  "...",
           "data":       {"document_id": "...", "tags": [...], "memory_unit_count": N}
         }
+
+    document_id may be missing/empty (Hindsight's auto-generated id is sometimes
+    not propagated into the webhook payload — see
+    hindsight_api/engine/retain/orchestrator.py:757). In that case the returned
+    ``RetainEvent.document_id`` is None and the caller is responsible for
+    recovery (e.g. via ``list_recent_units``).
     """
     try:
         body = json.loads(raw_body)
@@ -168,9 +180,8 @@ def parse_event(raw_body: bytes) -> RetainEvent | None:
     data = body.get("data")
     if not isinstance(bank_id, str) or not isinstance(data, dict):
         return None
-    document_id = data.get("document_id")
-    if not isinstance(document_id, str) or not document_id:
-        return None
+    raw_doc_id = data.get("document_id")
+    document_id: str | None = raw_doc_id if isinstance(raw_doc_id, str) and raw_doc_id else None
     count = data.get("memory_unit_count")
     if not isinstance(count, int):
         count = 0
@@ -230,6 +241,7 @@ def handle_event(
     *,
     secret: bytes,
     fetch_units: Callable[[str, str], list[dict[str, Any]]],
+    fetch_recent_doc: Callable[[str], str | None] | None = None,
 ) -> WebhookOutcome:
     """Process one webhook request end-to-end.
 
@@ -301,6 +313,38 @@ def handle_event(
         evt.memory_unit_count,
         evt.operation_id,
     )
+
+    # Fallback: Hindsight's outbox sometimes sends ``data={}`` (no document_id)
+    # because the client did not supply one and the server's auto-generated id
+    # is not written back into the content dict that flows into the webhook
+    # (see hindsight_api/engine/retain/orchestrator.py:757). When that happens
+    # we cannot target /memories/list by document_id, so we ask for the most
+    # recently mentioned unit in the bank and read its document_id. This is
+    # best-effort: under concurrent retains on the same bank the "most recent"
+    # unit may not belong to this retain, in which case reconcile will clean
+    # the wrong document — but the race is rare and self-correcting on the
+    # next retain.
+    if not evt.document_id and fetch_recent_doc is not None:
+        recovered = fetch_recent_doc(evt.bank_id)
+        if recovered:
+            log.info(
+                "fallback: recovered document_id=%r from most recent unit "
+                "(webhook data={} for bank=%s)",
+                recovered,
+                evt.bank_id,
+            )
+            evt = RetainEvent(
+                event=evt.event,
+                bank_id=evt.bank_id,
+                operation_id=evt.operation_id,
+                document_id=recovered,
+                memory_unit_count=evt.memory_unit_count,
+            )
+        else:
+            log.warning(
+                "fallback: no recent units in bank=%s; cannot reconcile",
+                evt.bank_id,
+            )
 
     # NOTE: ``memory_unit_count`` is the server's pre-extraction hint, not an
     # authoritative truth. We've observed cases where the count is 0 but

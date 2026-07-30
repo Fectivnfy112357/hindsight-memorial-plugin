@@ -112,9 +112,35 @@ def _process_post(
         )
         return client.list_memory_units(bank_id, document_id)
 
+    def fetch_recent_doc(bank_id: str) -> str | None:
+        """Read the most recently mentioned memory_unit and return its document_id.
+
+        Fallback for Hindsight retain paths that emit ``retain.completed`` with
+        ``data={}`` (no document_id) — the server generated a doc_id for the
+        commit but did not propagate it into the outbox payload. We pull the
+        bank's most recent unit to recover the linkage.
+        """
+        api_url = os.environ.get("HINDSIGHT_API_URL", "").strip()
+        if not api_url:
+            return None
+        client = HindsightClient(
+            base_url=api_url.rstrip("/"),
+            api_key=os.environ.get("HINDSIGHT_API_KEY"),
+        )
+        units = client.list_recent_units(bank_id, limit=5)
+        for u in units:
+            did = u.get("document_id")
+            if isinstance(did, str) and did:
+                return did
+        return None
+
     try:
         outcome = handle_event(
-            raw_body, headers, secret=secret, fetch_units=fetch_units
+            raw_body,
+            headers,
+            secret=secret,
+            fetch_units=fetch_units,
+            fetch_recent_doc=fetch_recent_doc,
         )
     except Exception:  # noqa: BLE001 — we want to log literally everything
         # Catch-all so any unhandled bug still returns 200 to Hindsight
