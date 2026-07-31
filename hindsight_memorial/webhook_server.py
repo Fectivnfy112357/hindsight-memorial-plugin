@@ -27,7 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .client import HindsightClient
-from .webhook_handlers import WebhookOutcome, configure_logging, handle_event
+from .dispatch import DUPLICATE, Dispatcher
+from .webhook_handlers import configure_logging, handle_event, verify_signature
 
 log = logging.getLogger("hindsight_memorial.webhook_server")
 
@@ -43,8 +44,8 @@ def _resolve_secret(arg: str | None) -> bytes:
     return secret.encode("utf-8")
 
 
-def _make_handler(secret: bytes):
-    """Build a request handler bound to the given secret + shared client builder."""
+def _make_handler(secret: bytes, dispatcher: Dispatcher):
+    """Build a request handler bound to the given secret + dispatcher."""
 
     class WebhookHandler(BaseHTTPRequestHandler):
         # Silence the default per-request stderr log; we have structured logging instead.
@@ -55,10 +56,22 @@ def _make_handler(secret: bytes):
             if self.path != "/webhook/hindsight":
                 self.send_error(HTTPStatus.NOT_FOUND, "unknown endpoint")
                 return
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw_body = self.rfile.read(length) if length > 0 else b""
-            headers = {k: v for k, v in self.headers.items()}
-            payload, status = _process_post(raw_body, headers, secret=secret)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw_body = self.rfile.read(length) if length > 0 else b""
+                headers = {k: v for k, v in self.headers.items()}
+                payload, status = _process_post(
+                    raw_body, headers, secret=secret, dispatcher=dispatcher
+                )
+            except Exception:
+                # Reading the body or admitting the event failed. Still answer
+                # 200: a non-2xx here restarts Hindsight's retry ladder, and a
+                # retry cannot fix a bug on our side.
+                log.exception("failed to admit request (path=%s)", self.path)
+                payload = json.dumps(
+                    {"status": "error", "error": "admission failed (see logs)"}
+                ).encode("utf-8")
+                status = HTTPStatus.OK
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -67,34 +80,24 @@ def _make_handler(secret: bytes):
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/healthz":
+                body = json.dumps({"status": "ok", **dispatcher.stats()}).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(b"ok")
+                self.wfile.write(body)
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "unknown endpoint")
 
     return WebhookHandler
 
 
-def _process_post(
-    raw_body: bytes,
-    headers: dict[str, str],
-    *,
-    secret: bytes,
-) -> tuple[bytes, int]:
-    """Process one /webhook/hindsight request and return (response_body, status).
+def run_event(raw_body: bytes, headers: dict[str, str], *, secret: bytes):
+    """The slow half: fetch units and reconcile. Runs on the dispatch worker.
 
-    Extracted from ``do_POST`` so it can be exercised without spinning up a
-    real BaseHTTPRequestHandler. Handles the full chain:
-
-      1. Build a fetch_units closure that talks to Hindsight's /memories/list.
-      2. Call ``handle_event`` inside a try/except so any unhandled exception
-         still produces a 200 response with a status=error body — this keeps
-         Hindsight's outbox from entering its 5s/5min/30min/2h/5h retry storm.
-      3. Pick HTTP status: 400 only if the body was malformed bytes; 200
-         otherwise (including signature failures, non-retain events, empty
-         documents, and unhandled bugs).
+    Called only after ``_process_post`` has authenticated the payload and
+    admitted it past dedup, so the HTTP caller is already answered. The
+    return value goes to the log, not to Hindsight.
     """
     def fetch_units(bank_id: str, document_id: str):
         api_url = os.environ.get("HINDSIGHT_API_URL", "").strip()
@@ -112,13 +115,18 @@ def _process_post(
         )
         return client.list_memory_units(bank_id, document_id)
 
-    def fetch_recent_doc(bank_id: str) -> str | None:
+    def fetch_recent_doc(bank_id: str) -> tuple[str, str | None] | None:
         """Read the most recently mentioned memory_unit and return its document_id.
 
         Fallback for Hindsight retain paths that emit ``retain.completed`` with
         ``data={}`` (no document_id) — the server generated a doc_id for the
         commit but did not propagate it into the outbox payload. We pull the
         bank's most recent unit to recover the linkage.
+
+        Returns ``(document_id, mentioned_at)`` so the handler can bounds-check
+        the recovered unit against the event timestamp. ``mentioned_at`` is
+        preferred (the unit is sorted by it on the server); we fall back to
+        ``created_at`` if the field is missing.
         """
         api_url = os.environ.get("HINDSIGHT_API_URL", "").strip()
         if not api_url:
@@ -130,59 +138,99 @@ def _process_post(
         units = client.list_recent_units(bank_id, limit=5)
         for u in units:
             did = u.get("document_id")
-            if isinstance(did, str) and did:
-                return did
+            if not isinstance(did, str) or not did:
+                continue
+            ts = u.get("mentioned_at") or u.get("created_at")
+            ts_str = ts if isinstance(ts, str) else None
+            return (did, ts_str)
         return None
 
-    try:
-        outcome = handle_event(
-            raw_body,
-            headers,
-            secret=secret,
-            fetch_units=fetch_units,
-            fetch_recent_doc=fetch_recent_doc,
-        )
-    except Exception:  # noqa: BLE001 — we want to log literally everything
-        # Catch-all so any unhandled bug still returns 200 to Hindsight
-        # (avoids the 5s/5min/30min/2h/5h outbox retry storm) and writes
-        # a full traceback to the log file. Without this, an uncaught
-        # exception produces a bare 500 with no diagnostic output.
-        log.exception(
-            "unhandled exception in webhook handler "
-            "(bytes=%d event_header=%r)",
-            len(raw_body),
-            headers.get("X-Hindsight-Event") or headers.get("x-hindsight-event"),
-        )
-        outcome = WebhookOutcome(
-            status="error",
-            error="internal handler error (see logs)",
-        )
+    return handle_event(
+        raw_body,
+        headers,
+        secret=secret,
+        fetch_units=fetch_units,
+        fetch_recent_doc=fetch_recent_doc,
+    )
+
+
+def _process_post(
+    raw_body: bytes,
+    headers: dict[str, str],
+    *,
+    secret: bytes,
+    dispatcher: Dispatcher,
+) -> tuple[bytes, int]:
+    """Admit one /webhook/hindsight request and answer immediately.
+
+    This is the *fast* half of the request path and it must stay fast: the
+    reconcile it schedules takes 10-70s (an LLM reflect call), and answering
+    only after that work finished is what triggered Hindsight's outbox retry
+    ladder during the 2026-07-30 incident. Each retry re-ran reflect on the
+    same fact and the invalidation count escalated 1 -> 10 -> 25.
+
+    Steps, all cheap:
+
+      1. Verify the HMAC signature. An unsigned/forged body is dropped here
+         and never reaches the queue.
+      2. Hand the body to the dispatcher, which drops replays and enqueues
+         everything else.
+      3. Return 200 with an acknowledgement.
+
+    The response no longer carries reconcile results — by design, since the
+    reconcile has not run yet. Outcomes are in the log (see
+    ``dispatch`` for the processing start/done/failed lines).
+    """
+    sig = None
+    event_name = None
+    for k, v in headers.items():
+        lk = k.lower()
+        if lk == "x-hindsight-signature":
+            sig = v
+        elif lk == "x-hindsight-event":
+            event_name = v
 
     log.info(
-        "webhook processed: status=%s bank=%s document=%s "
-        "units=%d superseded=%d observations_cleared=%d",
-        outcome.status,
-        outcome.bank_id,
-        outcome.document_id,
-        outcome.units_processed,
-        outcome.total_superseded,
-        outcome.total_observations_cleared,
+        "webhook received: bytes=%d event_header=%r sig_present=%s",
+        len(raw_body),
+        event_name,
+        bool(sig),
     )
-    status = (
-        HTTPStatus.BAD_REQUEST
-        if outcome.error == "malformed payload"
-        else HTTPStatus.OK
+
+    if not verify_signature(raw_body, sig, secret):
+        # Do not queue. Answer 200 anyway: a 401 makes Hindsight retry, and
+        # retrying will not produce a valid signature.
+        log.warning("signature verification failed (event=%r)", event_name)
+        return (
+            json.dumps(
+                {"status": "ignored", "error": "signature verification failed"}
+            ).encode("utf-8"),
+            HTTPStatus.OK,
+        )
+
+    admission = dispatcher.submit(raw_body, headers)
+    status_str = "duplicate" if admission == DUPLICATE else "accepted"
+    return (
+        json.dumps({"status": status_str}).encode("utf-8"),
+        HTTPStatus.OK,
     )
-    return json.dumps(outcome.to_dict()).encode("utf-8"), status
 
 
 def serve(host: str, port: int, secret: bytes) -> None:
-    server = ThreadingHTTPServer((host, port), _make_handler(secret))
+    dispatcher = Dispatcher(
+        lambda raw_body, headers: run_event(raw_body, headers, secret=secret)
+    )
+    dispatcher.start()
+    server = ThreadingHTTPServer((host, port), _make_handler(secret, dispatcher))
     log.info("hindsight-memorial webhook server listening on %s:%d", host, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("shutting down")
+    finally:
+        # Give the in-flight reconcile a chance to finish before the process
+        # exits; its dedup key stays in_flight and is never retried if it dies.
+        dispatcher.stop()
         server.server_close()
 
 

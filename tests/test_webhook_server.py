@@ -1,10 +1,14 @@
-"""Unit tests for ``hindsight_memorial.webhook_server`` exception handling.
+"""Unit tests for ``hindsight_memorial.webhook_server`` admission logic.
 
 ``do_POST`` lives inside ``BaseHTTPRequestHandler`` and depends on full HTTP
-request parsing (raw_requestline, requestline, command, etc.), which makes
-spinning it up in tests painful. Instead we exercise ``_process_post``,
-which is the actual webhook-handling logic that ``do_POST`` delegates to
-after reading the body.
+request parsing, which makes spinning it up in tests painful. Instead we
+exercise ``_process_post``, the admission path ``do_POST`` delegates to.
+
+The contract changed on 2026-07-31. ``_process_post`` used to run the whole
+reconcile inline and return its results; it now only authenticates and
+enqueues, because the inline reconcile took 10-70s and blew Hindsight's
+outbox timeout, which triggered the retry ladder behind the mass-invalidation
+incident. Reconcile outcomes are asserted in ``test_dispatch`` instead.
 """
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ import json
 import unittest
 from unittest import mock
 
-from hindsight_memorial import webhook_server
+from hindsight_memorial import dispatch, webhook_server
 
 
 def _signed_body(secret: bytes = b"test") -> tuple[bytes, dict[str, str]]:
@@ -35,75 +39,99 @@ def _signed_body(secret: bytes = b"test") -> tuple[bytes, dict[str, str]]:
     }
 
 
-class UnhandledExceptionTest(unittest.TestCase):
-    """Any uncaught exception inside ``_process_post`` must:
-      - emit a full traceback via ``log.exception`` (so the log file has it)
-      - return HTTP 200 with status=error (no Hindsight outbox retry storm)
-      - still produce a JSON body so the caller sees status='error'
-    """
+class _StubDispatcher:
+    """Records submissions without spawning a worker thread."""
 
-    def test_unhandled_exception_logs_traceback_and_returns_200(self):
+    def __init__(self, verdict: str = dispatch.QUEUED):
+        self.submitted: list[bytes] = []
+        self.verdict = verdict
+
+    def submit(self, raw_body: bytes, headers: dict[str, str]) -> str:
+        self.submitted.append(raw_body)
+        return self.verdict
+
+
+class AdmissionTest(unittest.TestCase):
+    def test_valid_event_is_queued_and_acked(self):
+        body, headers = _signed_body()
+        d = _StubDispatcher()
+
+        payload, status = webhook_server._process_post(
+            body, headers, secret=b"test", dispatcher=d
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["status"], "accepted")
+        self.assertEqual(d.submitted, [body])
+
+    def test_bad_signature_is_not_queued(self):
+        """A forged body must never reach the worker."""
+        body, headers = _signed_body()
+        headers["X-Hindsight-Signature"] = "sha256=" + ("0" * 64)
+        d = _StubDispatcher()
+
+        payload, status = webhook_server._process_post(
+            body, headers, secret=b"test", dispatcher=d
+        )
+
+        # 200, not 401: a retry cannot produce a valid signature, so inviting
+        # one just restarts the retry ladder.
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["status"], "ignored")
+        self.assertEqual(d.submitted, [])
+
+    def test_duplicate_verdict_is_reported(self):
+        body, headers = _signed_body()
+        d = _StubDispatcher(verdict=dispatch.DUPLICATE)
+
+        payload, status = webhook_server._process_post(
+            body, headers, secret=b"test", dispatcher=d
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["status"], "duplicate")
+
+    def test_admission_does_not_call_handle_event(self):
+        """The slow path must not run on the request thread.
+
+        This is the regression guard for the incident: handle_event makes the
+        LLM reflect call, and running it here is what caused the timeout.
+        """
         body, headers = _signed_body()
         with mock.patch.object(webhook_server, "handle_event") as mock_handle:
-            mock_handle.side_effect = RuntimeError("simulated bug")
+            webhook_server._process_post(
+                body, headers, secret=b"test", dispatcher=_StubDispatcher()
+            )
+        mock_handle.assert_not_called()
 
-            with self.assertLogs(webhook_server.log, level="ERROR") as captured:
-                payload, status = webhook_server._process_post(
-                    body, headers, secret=b"test"
-                )
 
-        # 1. The exception's error message reached the log.
-        joined = "\n".join(captured.output)
-        self.assertIn("simulated bug", joined)
-        self.assertIn("unhandled exception", joined)
-        # log.exception emits the traceback lines; assert at least one frame.
-        self.assertTrue(any("Traceback" in line for line in captured.output))
+class RunEventTest(unittest.TestCase):
+    """``run_event`` is the slow half that the worker calls."""
 
-        # 2. HTTP 200 (NOT 500) so Hindsight's outbox doesn't retry.
-        self.assertEqual(status, 200)
-
-        # 3. JSON body says status=error with a placeholder error message.
-        body_dict = json.loads(payload)
-        self.assertEqual(body_dict["status"], "error")
-        self.assertIn("internal handler error", body_dict["error"])
-
-    def test_normal_path_returns_200(self):
-        """Sanity: a clean handle_event call still returns 200 + ok status."""
+    def test_delegates_to_handle_event_with_both_fetchers(self):
+        body, headers = _signed_body()
         from hindsight_memorial.webhook_handlers import WebhookOutcome
 
-        body, headers = _signed_body()
-        outcome = WebhookOutcome(
-            status="ok",
-            bank_id="bank-1",
-            document_id="doc-1",
-            units_processed=1,
-            total_superseded=1,
-        )
+        outcome = WebhookOutcome(status="ok", bank_id="bank-1")
         with mock.patch.object(
             webhook_server, "handle_event", return_value=outcome
-        ):
-            payload, status = webhook_server._process_post(
-                body, headers, secret=b"test"
-            )
+        ) as mock_handle:
+            result = webhook_server.run_event(body, headers, secret=b"test")
 
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(payload)["status"], "ok")
+        self.assertIs(result, outcome)
+        kwargs = mock_handle.call_args.kwargs
+        self.assertEqual(kwargs["secret"], b"test")
+        self.assertTrue(callable(kwargs["fetch_units"]))
+        self.assertTrue(callable(kwargs["fetch_recent_doc"]))
 
-    def test_malformed_payload_returns_400(self):
-        """If ``handle_event`` reports 'malformed payload', we send 400."""
-        from hindsight_memorial.webhook_handlers import WebhookOutcome
-
+    def test_exception_propagates_to_the_worker(self):
+        """run_event does not swallow errors; the dispatcher logs them."""
         body, headers = _signed_body()
-        outcome = WebhookOutcome(status="skipped", error="malformed payload")
         with mock.patch.object(
-            webhook_server, "handle_event", return_value=outcome
+            webhook_server, "handle_event", side_effect=RuntimeError("boom")
         ):
-            payload, status = webhook_server._process_post(
-                body, headers, secret=b"test"
-            )
-
-        self.assertEqual(status, 400)
-        self.assertEqual(json.loads(payload)["status"], "skipped")
+            with self.assertRaises(RuntimeError):
+                webhook_server.run_event(body, headers, secret=b"test")
 
 
 if __name__ == "__main__":

@@ -191,6 +191,30 @@ def run_reconcile(
         )
 
     superseded = extract_superseded_ids(reflect_resp, exclude_ids=exclude_unit_ids)
+
+    # Log what reflect actually said, before acting on it. During the
+    # 2026-07-30 incident one reflect call returned 25 ids and every one was
+    # invalidated; because the reasoning was never recorded there is no way
+    # to reconstruct why those ids were chosen. Never act on an LLM verdict
+    # without first writing the verdict down.
+    structured = reflect_resp.get("structured_output")
+    reasoning = ""
+    raw_id_count = 0
+    if isinstance(structured, dict):
+        if isinstance(structured.get("reasoning"), str):
+            reasoning = structured["reasoning"]
+        raw_ids = structured.get("superseded_fact_ids")
+        if isinstance(raw_ids, list):
+            raw_id_count = len(raw_ids)
+    log.info(
+        "reflect verdict: bank=%s raw_ids=%d kept_ids=%d ids=%s reasoning=%r",
+        cfg.bank_id,
+        raw_id_count,
+        len(superseded),
+        superseded,
+        reasoning[:1000],
+    )
+
     if not superseded:
         return ReconcileResult(
             status="abandoned",
