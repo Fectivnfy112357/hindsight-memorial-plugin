@@ -26,14 +26,18 @@ WORKDIR /app
 # tests/, .git/, .venv/, etc. out; otherwise the image stays small anyway.
 COPY . /app
 
-# Healthcheck against the running server's /healthz. MEMORIAL_PORT defaults
-# to 9602; override via build arg if you also change the EXPOSE / CMD below.
+# Healthcheck against the running server's /healthz. The endpoint returns a
+# JSON body of the form {"status": "ok", "keys": N, "in_flight": N,
+# "queue_depth": N} — we parse the status field rather than comparing the
+# raw bytes (the older version expected b'ok' which broke when the body
+# became structured). MEMORIAL_PORT defaults to 9602; override via build
+# arg if you also change the EXPOSE / CMD below.
 ARG MEMORIAL_PORT=9602
 ENV MEMORIAL_PORT=${MEMORIAL_PORT}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys,os; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ['MEMORIAL_PORT']+'/healthz',timeout=3).read()==b'ok' else 1)"
+    CMD python -c "import urllib.request,json,sys,os; \
+sys.exit(0 if json.loads(urllib.request.urlopen('http://127.0.0.1:'+os.environ['MEMORIAL_PORT']+'/healthz',timeout=3).read()).get('status')=='ok' else 1)"
 
 EXPOSE 9602
 
