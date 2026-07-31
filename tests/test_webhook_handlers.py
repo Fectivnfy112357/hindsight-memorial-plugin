@@ -289,13 +289,17 @@ class HandleEventTest(unittest.TestCase):
     def _run_with_fallback(self, body, units, recent_units, fetch_recent_returns=None):
         """Drive handle_event with both fetch_units and fetch_recent_doc stubs."""
         if fetch_recent_returns is None:
-            # By default, fetch_recent_doc returns the document_id of the first
-            # recent unit that has one.
-            def fetch_recent_doc(bank_id: str) -> str | None:
+            # By default, fetch_recent_doc returns (document_id, mentioned_at)
+            # of the first recent unit that has a document_id. Units without a
+            # timestamp are returned with ts=None (the window check will skip
+            # the window guard, preserving the pre-window behaviour).
+            def fetch_recent_doc(bank_id: str) -> tuple[str, str | None] | None:
                 for u in recent_units:
                     did = u.get("document_id")
                     if isinstance(did, str) and did:
-                        return did
+                        ts = u.get("mentioned_at") or u.get("created_at")
+                        ts_str = ts if isinstance(ts, str) else None
+                        return (did, ts_str)
                 return None
         else:
             fetch_recent_doc = fetch_recent_returns
@@ -364,7 +368,7 @@ class HandleEventTest(unittest.TestCase):
 
         def fetch_recent_doc(bank_id):
             recent_called["n"] += 1
-            return "should-not-be-used"
+            return ("should-not-be-used", None)
 
         fake_client = mock.MagicMock()
         fake_client.list_banks.return_value = ["hindsight-memorial"]
@@ -380,6 +384,153 @@ class HandleEventTest(unittest.TestCase):
             outcome = self._run_with_fallback(body, units, [], fetch_recent_doc)
         self.assertEqual(recent_called["n"], 0)
         self.assertEqual(outcome.document_id, "doc-abc")
+
+    # ── fallback time window: stale recovered unit must be rejected ──
+
+    def _body_with_timestamp(self, ts: str) -> bytes:
+        body_dict = {
+            "event": "retain.completed",
+            "bank_id": "hindsight-memorial",
+            "operation_id": "op-x",
+            "timestamp": ts,
+            "data": {},
+        }
+        return json.dumps(body_dict).encode()
+
+    def test_fallback_accepts_unit_within_window(self):
+        """When the recovered unit's timestamp is within the window, fall
+        back proceeds normally."""
+        # Event happened at 12:00:00; recovered unit's mentioned_at 5s later.
+        body = self._body_with_timestamp("2026-07-31T12:00:00Z")
+        recent = [{
+            "id": "u-recent",
+            "document_id": "recovered-doc",
+            "text": "x",
+            "mentioned_at": "2026-07-31T12:00:05Z",
+        }]
+        units = [{"id": "u-recent", "text": "the recovered fact"}]
+
+        fake_client = mock.MagicMock()
+        fake_client.list_banks.return_value = ["hindsight-memorial"]
+        fake_client.reflect.return_value = {
+            "structured_output": {"superseded_fact_ids": [], "reasoning": "none"}
+        }
+
+        with mock.patch.dict(
+            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
+        ), mock.patch(
+            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
+            return_value=fake_client,
+        ):
+            outcome = self._run_with_fallback(body, units, recent)
+
+        # 5s gap is well within the 60s window: fallback proceeds to reconcile.
+        self.assertEqual(outcome.document_id, "recovered-doc")
+        self.assertEqual(outcome.status, "abandoned")
+        self.assertEqual(outcome.units_processed, 1)
+
+    def test_fallback_rejects_unit_outside_window(self):
+        """When the recovered unit's timestamp is far from the event, the
+        handler must skip rather than reconcile the wrong document."""
+        # Event at 12:00:00; recovered unit's mentioned_at 5 hours earlier.
+        # This mirrors the legacy 5h-ladder retry case.
+        body = self._body_with_timestamp("2026-07-31T12:00:00Z")
+        recent = [{
+            "id": "u-stale",
+            "document_id": "stale-doc",
+            "text": "x",
+            "mentioned_at": "2026-07-31T07:00:00Z",
+        }]
+        units = [{"id": "u-stale", "text": "the stale fact"}]
+
+        fake_client = mock.MagicMock()
+        fake_client.list_banks.return_value = ["hindsight-memorial"]
+        fake_client.reflect.return_value = {
+            "structured_output": {"superseded_fact_ids": [], "reasoning": "none"}
+        }
+
+        with mock.patch.dict(
+            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
+        ), mock.patch(
+            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
+            return_value=fake_client,
+        ):
+            outcome = self._run_with_fallback(body, units, recent)
+
+        # 5h gap is way outside the 60s window: skip, never call reflect.
+        self.assertEqual(outcome.status, "skipped")
+        self.assertIsNone(outcome.document_id)
+        self.assertEqual(outcome.units_processed, 0)
+        self.assertIn("outside 60s", outcome.reason)
+        # The contract: when skipped at the fallback, reflect must not be called.
+        fake_client.reflect.assert_not_called()
+
+    def test_fallback_accepts_when_unit_timestamp_missing(self):
+        """If the recovered unit has no timestamp, the window check is
+        skipped (returns True — we don't compound missing-data problems)."""
+        body = self._body_with_timestamp("2026-07-31T12:00:00Z")
+        recent = [{
+            "id": "u-no-ts",
+            "document_id": "no-ts-doc",
+            "text": "x",
+            # No mentioned_at, no created_at.
+        }]
+        units = [{"id": "u-no-ts", "text": "the recovered fact"}]
+
+        fake_client = mock.MagicMock()
+        fake_client.list_banks.return_value = ["hindsight-memorial"]
+        fake_client.reflect.return_value = {
+            "structured_output": {"superseded_fact_ids": [], "reasoning": "none"}
+        }
+
+        with mock.patch.dict(
+            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
+        ), mock.patch(
+            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
+            return_value=fake_client,
+        ):
+            outcome = self._run_with_fallback(body, units, recent)
+
+        # No timestamp on unit → window check skipped → fallback proceeds.
+        self.assertEqual(outcome.document_id, "no-ts-doc")
+        self.assertEqual(outcome.status, "abandoned")
+
+    def test_fallback_accepts_when_event_timestamp_missing(self):
+        """If the payload has no timestamp, the window check is skipped
+        (returns True — we don't fault the consumer for a missing field)."""
+        body_dict = {
+            "event": "retain.completed",
+            "bank_id": "hindsight-memorial",
+            "operation_id": "op-x",
+            # No timestamp.
+            "data": {},
+        }
+        body = json.dumps(body_dict).encode()
+        recent = [{
+            "id": "u-recent",
+            "document_id": "recovered-doc",
+            "text": "x",
+            "mentioned_at": "2026-07-31T12:00:05Z",
+        }]
+        units = [{"id": "u-recent", "text": "the recovered fact"}]
+
+        fake_client = mock.MagicMock()
+        fake_client.list_banks.return_value = ["hindsight-memorial"]
+        fake_client.reflect.return_value = {
+            "structured_output": {"superseded_fact_ids": [], "reasoning": "none"}
+        }
+
+        with mock.patch.dict(
+            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
+        ), mock.patch(
+            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
+            return_value=fake_client,
+        ):
+            outcome = self._run_with_fallback(body, units, recent)
+
+        # No event timestamp → window check skipped → fallback proceeds.
+        self.assertEqual(outcome.document_id, "recovered-doc")
+        self.assertEqual(outcome.status, "abandoned")
 
 
 class WebhookConfigLoaderTest(unittest.TestCase):

@@ -27,10 +27,22 @@ import logging
 import logging.handlers
 import os
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .config import MemorialConfig
 from .reconcile import ConfigLoader, ReconcileResult, run_reconcile
+
+# Time window (seconds) for accepting a fallback unit (recovered via
+# list_recent_units when data={}). The unit's mentioned_at (or created_at)
+# must fall within this many seconds of the event's timestamp; otherwise
+# the recovered unit is almost certainly unrelated to this event and we
+# skip it. 60s comfortably covers Hindsight-side processing latency and
+# worker queueing under normal load. A/B + idempotency fixes mean stale
+# retries from A/B's pre-fix window are no longer produced, so this guard
+# mainly catches very-old recovered units that race into the bank before
+# the legitimate event arrives.
+FALLBACK_TIMESTAMP_WINDOW_SECONDS = 60
 
 log = logging.getLogger("hindsight_memorial.webhook_handlers")
 
@@ -104,6 +116,11 @@ class RetainEvent:
     operation_id: str | None
     document_id: str | None
     memory_unit_count: int
+    # Server-side timestamp of the retain event itself (from webhook payload
+    # top-level ``timestamp`` field). Used by the fallback path to bounds-check
+    # against the recovered unit's mentioned_at/created_at. None if the payload
+    # omitted or malformed the timestamp.
+    event_timestamp: datetime | None = None
 
 
 # ── result aggregation ───────────────────────────────────────────────────
@@ -188,14 +205,58 @@ def parse_event(raw_body: bytes) -> RetainEvent | None:
     operation_id = body.get("operation_id")
     if not isinstance(operation_id, str):
         operation_id = None
+    event_timestamp = _parse_timestamp(body.get("timestamp"))
     return RetainEvent(
         event="retain.completed",
         bank_id=bank_id,
         operation_id=operation_id,
         document_id=document_id,
         memory_unit_count=count,
+        event_timestamp=event_timestamp,
     )
 
+
+def _parse_timestamp(raw: Any) -> datetime | None:
+    """Parse the webhook payload's top-level ``timestamp`` field.
+
+    Hindsight emits ISO-8601 with a trailing ``Z`` (UTC). We normalise to a
+    tz-aware ``datetime`` in UTC. Returns None on any parse failure or
+    non-string input — the caller treats that as "no timestamp available"
+    and skips the fallback window check.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _within_fallback_window(
+    event_ts: datetime | None,
+    unit_ts_raw: str | None,
+) -> bool:
+    """True iff the recovered unit's timestamp is close enough to the event.
+
+    Both inputs may be absent or unparseable. If either side is missing we
+    accept the recovery (returns True) — the missing timestamp is a separate
+    problem from the race we're guarding against, and we don't want to make
+    things worse by skipping the event on a missing field. The race guard
+    only fires when both sides are present and the gap is too large.
+    """
+    if not event_ts or not unit_ts_raw:
+        return True
+    unit_dt = _parse_timestamp(unit_ts_raw)
+    if unit_dt is None:
+        return True
+    delta = abs((event_ts - unit_dt).total_seconds())
+    return delta <= FALLBACK_TIMESTAMP_WINDOW_SECONDS
 
 def _safe_json(raw_body: bytes) -> Any:
     """Parse JSON body for diagnostic logging. Never raises — returns None on any error."""
@@ -241,7 +302,7 @@ def handle_event(
     *,
     secret: bytes,
     fetch_units: Callable[[str, str], list[dict[str, Any]]],
-    fetch_recent_doc: Callable[[str], str | None] | None = None,
+    fetch_recent_doc: Callable[[str], tuple[str, str | None] | None] | None = None,
 ) -> WebhookOutcome:
     """Process one webhook request end-to-end.
 
@@ -324,22 +385,58 @@ def handle_event(
     # unit may not belong to this retain, in which case reconcile will clean
     # the wrong document — but the race is rare and self-correcting on the
     # next retain.
+    #
+    # Time-window guard: the recovered unit's mentioned_at (or created_at)
+    # must fall within FALLBACK_TIMESTAMP_WINDOW_SECONDS of the event's
+    # payload timestamp. This catches the "A/B pre-fix retry from 5h ago"
+    # class of stale legacy events still queued in Hindsight's outbox, and
+    # race-window cases where a concurrent retain won the "most recent" slot.
+    # If the recovery is timestamp-rejected, we skip the event rather than
+    # risk reconciling the wrong document.
     if not evt.document_id and fetch_recent_doc is not None:
         recovered = fetch_recent_doc(evt.bank_id)
         if recovered:
-            log.info(
-                "fallback: recovered document_id=%r from most recent unit "
-                "(webhook data={} for bank=%s)",
-                recovered,
-                evt.bank_id,
-            )
-            evt = RetainEvent(
-                event=evt.event,
-                bank_id=evt.bank_id,
-                operation_id=evt.operation_id,
-                document_id=recovered,
-                memory_unit_count=evt.memory_unit_count,
-            )
+            recovered_doc_id, recovered_unit_ts = recovered
+            if _within_fallback_window(evt.event_timestamp, recovered_unit_ts):
+                log.info(
+                    "fallback: recovered document_id=%r from most recent unit "
+                    "(webhook data={} for bank=%s event_ts=%s unit_ts=%s)",
+                    recovered_doc_id,
+                    evt.bank_id,
+                    evt.event_timestamp.isoformat() if evt.event_timestamp else None,
+                    recovered_unit_ts,
+                )
+                evt = RetainEvent(
+                    event=evt.event,
+                    bank_id=evt.bank_id,
+                    operation_id=evt.operation_id,
+                    document_id=recovered_doc_id,
+                    memory_unit_count=evt.memory_unit_count,
+                    event_timestamp=evt.event_timestamp,
+                )
+            else:
+                log.warning(
+                    "fallback rejected: recovered document_id=%r unit_ts=%s "
+                    "outside %ds window of event_ts=%s bank=%s; "
+                    "skipping to avoid reconciling a stale unit",
+                    recovered_doc_id,
+                    recovered_unit_ts,
+                    FALLBACK_TIMESTAMP_WINDOW_SECONDS,
+                    evt.event_timestamp.isoformat() if evt.event_timestamp else None,
+                    evt.bank_id,
+                )
+                return WebhookOutcome(
+                    status="skipped",
+                    bank_id=evt.bank_id,
+                    document_id=None,
+                    memory_unit_count=evt.memory_unit_count,
+                    reason=(
+                        f"fallback recovered unit timestamp {recovered_unit_ts!r} "
+                        f"outside {FALLBACK_TIMESTAMP_WINDOW_SECONDS}s of event "
+                        f"timestamp {evt.event_timestamp.isoformat() if evt.event_timestamp else None!r}; "
+                        f"event likely targets a different document"
+                    ),
+                )
         else:
             log.warning(
                 "fallback: no recent units in bank=%s; cannot reconcile",
