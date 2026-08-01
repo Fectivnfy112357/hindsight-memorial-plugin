@@ -20,14 +20,7 @@ CREATE DATABASE IF NOT EXISTS hindsight_memorial
     COLLATE utf8mb4_unicode_ci;
 
 -- 2. 建用户。
---    - '172.23.%': 容器通过 host.docker.internal 进来,源 IP 在 docker bridge 上,
---      大概率落在 172.23.0.0/16(hindsight_default 子网)。
---    - 'localhost': 同机直接连(运维/CI/调试用)。
---    如果你的 docker 子网不是 172.23.0.0/16,改下面两行。
-CREATE USER IF NOT EXISTS 'memorial'@'172.23.%'
-    IDENTIFIED BY 'Mem0rial_HS_2026_aK7x';
-CREATE USER IF NOT EXISTS 'memorial'@'localhost'
-    IDENTIFIED BY 'Mem0rial_HS_2026_aK7x';
+ALTER USER 'hindsight_memorial'@'%' IDENTIFIED BY 'Yishengaini12345';
 
 -- 3. 授权。memorial 需要在这个库里:
 --    - SELECT/INSERT/UPDATE/DELETE:日常读写
@@ -38,10 +31,6 @@ CREATE USER IF NOT EXISTS 'memorial'@'localhost'
 GRANT SELECT, INSERT, UPDATE, DELETE,
       CREATE, DROP, ALTER, INDEX, CREATE VIEW
     ON hindsight_memorial.*
-    TO 'memorial'@'172.23.%';
-GRANT SELECT, INSERT, UPDATE, DELETE,
-      CREATE, DROP, ALTER, INDEX, CREATE VIEW
-    ON hindsight_memorial.*
-    TO 'memorial'@'localhost';
+    TO 'memorial'@'%';
 
 FLUSH PRIVILEGES;
