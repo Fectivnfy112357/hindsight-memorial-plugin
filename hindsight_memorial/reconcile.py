@@ -288,6 +288,11 @@ def _curate_and_return(
         observations_cleared=report.observations_cleared_count,
         errors=report.error_count,
         results=[asdict(r) for r in report.results],
+        # The same string Hindsight persists in
+        # invalidated_memory_units.invalidation_reason. The poller reads
+        # this to fill the local superseded_reason column so the two
+        # audit trails stay identical.
+        reason=reason,
     )
 
 

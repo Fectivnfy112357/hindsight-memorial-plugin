@@ -233,6 +233,40 @@ class NewSignatureTest(unittest.TestCase):
         reason = client.update_calls[0]["reason"]
         self.assertIn(reasoning_text, reason)
 
+    def test_result_carries_reasoning_for_the_local_mirror(self):
+        """ReconcileResult.reason must hold the same reasoning string sent
+        to Hindsight. The poller reads it to fill the local
+        superseded_reason column; when it was left None the poller silently
+        fell back to a placeholder and the two audit trails diverged."""
+        other_id = "22222222-2222-2222-2222-222222222222"
+        reasoning_text = "this old fact is contradicted by the new one"
+        client = _FakeClient(
+            banks=["b1"],
+            reflect_seq=[
+                {
+                    "structured_output": {
+                        "superseded_fact_ids": [other_id],
+                        "reasoning": reasoning_text,
+                    }
+                }
+            ],
+            patch_responses=[{"memory": {"id": other_id, "state": "invalidated"}}],
+            delete_responses=[{"deleted_count": 1}],
+        )
+        with mock.patch.object(reconcile, "HindsightClient") as HC:
+            HC.from_memorial_config.return_value = client
+            result = reconcile.run_reconcile(
+                bank_id="b1",
+                unit_id="11111111-1111-1111-1111-111111111111",
+                content="new fact body",
+                load_cfg=_loader(_cfg()),
+            )
+        self.assertEqual(result.status, "ok")
+        self.assertIsNotNone(result.reason)
+        self.assertIn(reasoning_text, result.reason)
+        # Same string on both sides of the audit trail.
+        self.assertEqual(result.reason, client.update_calls[0]["reason"])
+
     def test_reflect_failure_returns_reflect_failed(self):
         err = reconcile.HindsightAPIError(500, "boom", "http://test/reflect")
         client = _FakeClient(banks=["b1"], reflect_errors=[err])
