@@ -25,20 +25,34 @@ class StructuredPathTest(unittest.TestCase):
 
 
 class FallbackTest(unittest.TestCase):
+    """Legacy fallback behaviour — only enabled when the caller explicitly
+    passes ``structured_only=False``. These tests pin the behaviour of
+    that opt-in path. The default (and production) path is
+    ``structured_only=True`` and is covered in
+    ``test_reflect_query_structured_only.py``.
+    """
+
     def test_falls_back_to_text_when_structured_missing(self):
         resp = {"text": f"Superseded by new fact: {UUID_A}, also {UUID_B}"}
-        self.assertEqual(extract_superseded_ids(resp), [UUID_A, UUID_B])
+        self.assertEqual(
+            extract_superseded_ids(resp, structured_only=False), [UUID_A, UUID_B]
+        )
 
     def test_falls_back_to_reasoning_when_both_missing(self):
         resp = {"structured_output": {"reasoning": f"id={UUID_C} is old"}}
-        self.assertEqual(extract_superseded_ids(resp), [UUID_C])
+        self.assertEqual(
+            extract_superseded_ids(resp, structured_only=False), [UUID_C]
+        )
 
     def test_dedupes(self):
         resp = {
             "structured_output": {"superseded_fact_ids": [UUID_A, UUID_A]},
             "text": f"and {UUID_A}",
         }
-        self.assertEqual(extract_superseded_ids(resp), [UUID_A])
+        # structured_only=True: just the structured list (one entry, deduped).
+        self.assertEqual(extract_superseded_ids(resp, structured_only=True), [UUID_A])
+        # structured_only=False: same answer, but proven across both paths.
+        self.assertEqual(extract_superseded_ids(resp, structured_only=False), [UUID_A])
 
     def test_ignores_garbage(self):
         resp = {"structured_output": {"superseded_fact_ids": ["not-a-uuid", UUID_A]}}
@@ -78,13 +92,16 @@ class ExcludeIdsTest(unittest.TestCase):
         )
 
     def test_excludes_id_in_text_fallback(self):
-        # When structured_output is empty, we fall back to scanning text.
+        # When structured_output is empty AND the caller opts in to the
+        # legacy fallback, we scan text. exclude_ids must still apply.
         resp = {
             "structured_output": {},
             "text": f"the new fact {self.NEW_FACT} supersedes {UUID_A}",
         }
         self.assertEqual(
-            extract_superseded_ids(resp, exclude_ids=[self.NEW_FACT]),
+            extract_superseded_ids(
+                resp, exclude_ids=[self.NEW_FACT], structured_only=False
+            ),
             [UUID_A],
         )
 

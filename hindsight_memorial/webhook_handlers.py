@@ -1,19 +1,15 @@
 """Webhook entry point for hindsight-memorial.
 
 The Hindsight server POSTs ``retain.completed`` events here after each
-ingest. For each event we:
+ingest. The handler is now ingest-only: it authenticates the payload,
+parses the event, optionally recovers a missing ``document_id`` via the
+recent-units fallback, and writes the freshly retained memory_units to
+the local ``memory_units`` table. Reflect + curate happens later on the
+poller thread (``hindsight_memorial.poller``).
 
-  1. Verify the HMAC-SHA256 signature in ``X-Hindsight-Signature`` against
-     the raw request body using the shared secret.
-  2. Look up the freshly retained memory_units for ``data.document_id``
-     via ``GET /v1/default/banks/{bank_id}/memories/list?document_id=...``.
-  3. Run ``reconcile.run_reconcile`` **once per memory_unit** — facts in the
-     same document are not necessarily mutually consistent, so we deliberately
-     avoid fusing them into a single reflect query.
-
-The handler is a plain function over ``(raw_body, headers, secret)`` so it
-has no HTTP framework dependency and can be exercised end-to-end with
-``FakeClient`` in tests.
+The slow reconcile is no longer part of the webhook path. The HTTP
+caller is answered 200 as soon as the units are durably persisted in
+the local table; a request thread never blocks on an LLM reflect call.
 
 Reference: Hindsight source ``hindsight_api/webhooks/manager.py`` for the
 signature scheme (``sha256=<hex>`` HMAC over the raw POST body).
@@ -30,8 +26,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from . import db
 from .config import MemorialConfig
-from .reconcile import ConfigLoader, ReconcileResult, run_reconcile
+from .reconcile import ConfigLoader
 
 # Time window (seconds) for accepting a fallback unit (recovered via
 # list_recent_units when data={}). The unit's mentioned_at (or created_at)
@@ -138,6 +135,11 @@ class WebhookOutcome:
     units_skipped: int = 0
     total_superseded: int = 0
     total_observations_cleared: int = 0
+    # 2026-08-01 redesign: the handler is now ingest-only, so the result
+    # of the per-unit upserts is reported here. Keys: 'inserted', 'updated',
+    # 'skipped'. (Distinct from units_skipped, which counts units the
+    # Hindsight side did not return.)
+    ingest_stats: dict[str, int] = field(default_factory=dict)
     results: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     reason: str | None = None
@@ -454,7 +456,6 @@ def handle_event(
         evt.bank_id,
         evt.document_id,
         len(units),
-
         evt.memory_unit_count,
     )
     if not units:
@@ -471,96 +472,109 @@ def handle_event(
             reason="no memory_units returned by /memories/list (count hint from server may be unreliable)",
         )
 
-    loader = webhook_config_loader(evt.bank_id)
-    per_unit: list[ReconcileResult] = []
-    for idx, unit in enumerate(units, start=1):
-        text = unit.get("text") if isinstance(unit, dict) else None
-        unit_id = unit.get("id") if isinstance(unit, dict) else None
-        if not isinstance(text, str) or not text.strip():
-            log.info(
-                "unit %d/%d skipped (no text) bank=%s document=%s unit_id=%s",
-                idx,
-                len(units),
-                evt.bank_id,
-                evt.document_id,
-                unit_id,
-            )
-            per_unit.append(
-                ReconcileResult(
-                    status="skipped",
-                    bank_id=evt.bank_id,
-                    bank_source="event",
-                    reason="memory_unit has no text field",
-                )
-            )
-            continue
-        log.info(
-            "unit %d/%d reconciling bank=%s document=%s unit_id=%s text_preview=%r",
-            idx,
-            len(units),
-            evt.bank_id,
-            evt.document_id,
-            unit_id,
-            text.strip()[:120],
-        )
-        result = run_reconcile(
-            text.strip(),
-            load_cfg=loader,
-            exclude_unit_ids=[unit_id] if unit_id else None,
-        )
-        log.info(
-            "unit %d/%d result=%s superseded=%d observations_cleared=%d error=%s",
-            idx,
-            len(units),
-            result.status,
-            result.superseded_count,
-            result.observations_cleared,
-            result.error,
-        )
-        per_unit.append(result)
+    stats = _ingest_units(evt.bank_id, units, document_id=evt.document_id)
+    log.info(
+        "ingested: bank=%s document=%s inserted=%d updated=%d skipped=%d",
+        evt.bank_id,
+        evt.document_id,
+        stats["inserted"],
+        stats["updated"],
+        stats["skipped"],
+    )
 
-    return _aggregate(evt, per_unit)
-
-
-def _aggregate(evt: RetainEvent, results: list[ReconcileResult]) -> WebhookOutcome:
-    """Fold a list of per-unit reconcile results into one WebhookOutcome."""
-    worst = "abandoned"
-    total_superseded = 0
-    total_obs = 0
-    units_processed = 0
-    units_skipped = 0
-    error_message: str | None = None
-
-    for r in results:
-        # Promote "worst" status using a fixed ladder.
-        if r.status == "ok":
-            worst = "ok"
-            total_superseded += r.superseded_count
-            total_obs += r.observations_cleared
-            units_processed += 1
-        elif r.status in ("reflect_failed", "error"):
-            if worst != "ok":
-                worst = r.status
-            error_message = error_message or r.error
-            units_processed += 1
-        elif r.status == "skipped":
-            units_skipped += 1
-        else:  # "abandoned" / "list_banks_failed" / "dry_run"
-            if worst not in ("ok", "reflect_failed", "error"):
-                worst = r.status
-            units_processed += 1
-
+    # The handler is now ingest-only. The poller thread will pick up
+    # the freshly written 'pending' rows and run reflect + curate
+    # against them. We return 200 here regardless of how many units
+    # were inserted/updated/skipped — every unit that arrived is now
+    # durably queued in the local table.
     return WebhookOutcome(
-        status=worst,
+        status="ok",
         bank_id=evt.bank_id,
         document_id=evt.document_id,
         memory_unit_count=evt.memory_unit_count,
-        units_processed=units_processed,
-        units_skipped=units_skipped,
-        total_superseded=total_superseded,
-        total_observations_cleared=total_obs,
-        results=[r.to_dict() for r in results],
-        error=error_message,
+        units_processed=stats["inserted"] + stats["updated"],
+        units_skipped=stats["skipped"],
+        ingest_stats=stats,
+    )
+
+
+def _ingest_units(
+    bank_id: str,
+    units: list[dict[str, Any]],
+    *,
+    document_id: str | None,
+) -> dict[str, int]:
+    """Upsert each unit into the local ``memory_units`` table.
+
+    Time field resolution (Hindsight returns ISO 8601 strings):
+      1. ``mentioned_at`` (preferred — when the fact was learned)
+      2. ``date`` (Hindsight renders this from the DB column event_date;
+         can be far in the past, but better than nothing)
+      3. NOW (last-resort fallback, should rarely fire)
+
+    Returns a counter dict ``{inserted, updated, skipped}``. A unit
+    whose dict does not carry a string ``id`` or a non-empty ``text``
+    is silently dropped (logged at INFO) — the same behaviour as the
+    pre-redesign handler, so callers that intentionally send units
+    with no body (e.g. observations) keep working.
+    """
+    stats = {"inserted": 0, "updated": 0, "skipped": 0}
+    if not units:
+        return stats
+    conn = db.get_connection()
+    try:
+        for idx, unit in enumerate(units, start=1):
+            if not isinstance(unit, dict):
+                continue
+            unit_id = unit.get("id")
+            text = unit.get("text")
+            if not isinstance(unit_id, str) or not unit_id:
+                log.info(
+                    "unit %d/%d dropped (no id) bank=%s",
+                    idx, len(units), bank_id,
+                )
+                continue
+            if not isinstance(text, str) or not text.strip():
+                log.info(
+                    "unit %d/%d dropped (no text) bank=%s unit_id=%s",
+                    idx, len(units), bank_id, unit_id,
+                )
+                continue
+            ts_raw = unit.get("mentioned_at") or unit.get("date")
+            created_at = _parse_timestamp(ts_raw) or datetime.now(timezone.utc)
+            doc_id_value = unit.get("document_id")
+            if not isinstance(doc_id_value, str) or not doc_id_value:
+                doc_id_value = document_id
+            outcome = db.upsert_unit_on_conn(
+                conn,
+                bank_id=bank_id,
+                unit_id=unit_id,
+                content=text.strip(),
+                created_at=created_at,
+                document_id=doc_id_value,
+            )
+            stats[outcome] += 1
+    finally:
+        # For SQLite (in-memory) the connection is single-use; for the
+        # MySQL backend (task #17) the connection is pooled and the
+        # backend's get_connection() will return a fresh one next call.
+        # Either way, the handler does NOT close the connection — the
+        # pool / fixture owns that lifecycle.
+        pass
+    return stats
+
+
+def _aggregate(evt: RetainEvent, results: list[Any]) -> WebhookOutcome:
+    """Deprecated: kept for import compatibility. The new handler path
+    no longer aggregates per-unit reconcile results; the poller does
+    that work asynchronously. This function is only called from the
+    legacy import surface (``hindsight_memorial.webhook_handlers._aggregate``)
+    and is a no-op in practice."""
+    return WebhookOutcome(
+        status="ok",
+        bank_id=evt.bank_id,
+        document_id=evt.document_id,
+        memory_unit_count=evt.memory_unit_count,
     )
 
 

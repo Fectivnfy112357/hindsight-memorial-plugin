@@ -9,9 +9,14 @@ description = "Webhook-driven pollution cleanup for Hindsight memories. Receives
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-# Stdlib-only by design — no third-party deps. The webhook server uses
-# http.server.ThreadingHTTPServer, the HTTP client uses urllib, HMAC uses hashlib.
-dependencies = []
+# Stdlib-only at the HTTP layer (urllib, http.server). The persistence
+# layer uses PyMySQL in production so the reconciler state survives
+# container restarts and shares with external observability tooling
+# (see doc/persistent-reconciler-design-2026-08-01.md). SQLite is the
+# fallback used by tests and by the "ingest-only" deployment mode.
+dependencies = [
+    "PyMySQL>=1.1.0",
+]
 authors = [{ name = "贾晓源" }]
 keywords = ["hindsight", "memory", "agent", "cleanup", "pollution", "webhook"]
 

@@ -103,9 +103,28 @@ class HindsightClient:
             err_body = e.read().decode("utf-8", errors="replace")
             raise HindsightAPIError(e.code, err_body, url) from e
         except urllib.error.URLError as e:
-            # Network-level failure (DNS, connection refused, timeout). Wrap it so callers
-            # see a single typed exception and treat it the same as a server-side failure.
+            # Network-level failure (DNS, connection refused, timeout via the
+            # legacy "timeout" attribute on URLError). Wrap it so callers
+            # see a single typed exception and treat it the same as a
+            # server-side failure.
             raise HindsightAPIError(0, repr(e.reason), url) from e
+        except TimeoutError as e:
+            # Python 3.10+ raises a built-in ``TimeoutError`` (an
+            # ``OSError`` subclass) for ``urlopen(timeout=...)`` — it
+            # does NOT come through as ``URLError``. Without this branch
+            # the timeout bubbles up as a plain ``TimeoutError`` and the
+            # caller (e.g. ``reconcile.run_reconcile``) sees a different
+            # exception type than the rest of the network-failure path.
+            # Wrap it the same way so logging and the poller's failed-row
+            # bookkeeping stay uniform.
+            raise HindsightAPIError(0, repr(e), url) from e
+        except OSError as e:
+            # Catch-all for any other socket-level errors that aren't
+            # already HTTPError / URLError / TimeoutError (e.g.
+            # ConnectionResetError). The previous code only caught
+            # HTTPError + URLError, so ConnectionResetError and friends
+            # escaped the wrap. Same uniform treatment here.
+            raise HindsightAPIError(0, repr(e), url) from e
 
     # ---- public API ----
 
@@ -115,14 +134,20 @@ class HindsightClient:
         query: str,
         *,
         structured_output: dict[str, Any] | None = None,
-        include_based_on: bool = True,
     ) -> dict[str, Any]:
         """POST /v1/default/banks/{bank_id}/reflect
 
         If `structured_output` is given, it is passed through as the response schema and the returned
         `structured_output` field is expected to be a JSON object conforming to it.
+
+        Note: the request deliberately does not include the ``include`` block.
+        Hindsight's reflect defaults to omitting the ``based_on`` block unless
+        ``include.facts`` is explicitly set; memorial does not consume
+        ``based_on`` (the supersede list comes from
+        ``structured_output.superseded_fact_ids`` via the LLM verdict), so
+        adding it would only inflate the response payload.
         """
-        body: dict[str, Any] = {"query": query, "include_based_on": include_based_on}
+        body: dict[str, Any] = {"query": query}
         if structured_output is not None:
             body["response_schema"] = structured_output
         return self._request(

@@ -32,6 +32,63 @@ DEFAULT_HERMES_CONFIG_PATH = Path.home() / ".hindsight" / "hermes.json"
 
 
 @dataclass(frozen=True)
+class DBConfig:
+    """Connection parameters for the persistent reconciler backend.
+
+    ``backend`` is either ``"mysql"`` (production) or ``"sqlite"`` (tests
+    and the "ingest-only" local mode). The other fields are interpreted
+    by :mod:`hindsight_memorial.db_mysql` for MySQL and ignored for SQLite.
+    """
+
+    backend: str = "sqlite"
+    host: str = "127.0.0.1"
+    port: int = 3306
+    user: str = "memorial"
+    password: str = ""
+    database: str = "hindsight_memorial"
+
+
+@dataclass(frozen=True)
+class PollerConfig:
+    """Runtime knobs for the :class:`~hindsight_memorial.poller.ReconcilerPoller`."""
+
+    enabled: bool = True
+    interval_sec: float = 1.0
+
+
+def load_db_config(env: dict[str, str] | None = None) -> DBConfig:
+    """Read DB connection settings from the environment.
+
+    If ``HINDSIGHT_MYSQL_HOST`` is set, the backend is MySQL. Otherwise
+    the backend is SQLite (in-memory, useful for tests and the local
+    "ingest-only" mode).
+    """
+    e = env if env is not None else os.environ
+    host = e.get("HINDSIGHT_MYSQL_HOST", "").strip()
+    if not host:
+        return DBConfig(backend="sqlite")
+    return DBConfig(
+        backend="mysql",
+        host=host,
+        port=int(e.get("HINDSIGHT_MYSQL_PORT", "3306")),
+        user=e.get("HINDSIGHT_MYSQL_USER", "memorial"),
+        password=e.get("HINDSIGHT_MYSQL_PASSWORD", ""),
+        database=e.get("HINDSIGHT_MYSQL_DATABASE", "hindsight_memorial"),
+    )
+
+
+def load_poller_config(env: dict[str, str] | None = None) -> PollerConfig:
+    """Read poller settings from the environment."""
+    e = env if env is not None else os.environ
+    enabled = e.get("HINDSIGHT_POLLER_ENABLED", "1") != "0"
+    try:
+        interval = float(e.get("HINDSIGHT_POLLER_INTERVAL_SEC", "1.0"))
+    except ValueError:
+        interval = 1.0
+    return PollerConfig(enabled=enabled, interval_sec=interval)
+
+
+@dataclass(frozen=True)
 class MemorialConfig:
     """Resolved config: API URL/key plus the bank id to operate on.
 

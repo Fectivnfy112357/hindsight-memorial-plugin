@@ -1,11 +1,12 @@
-"""Shared retain → reflect → curate pipeline used by the webhook entry point.
+"""Shared retain → reflect → curate pipeline used by the poller.
 
 Flow:
 
   1. Build a HindsightClient from MemorialConfig.
   2. Verify the resolved bank exists on the server.
   3. Run reflect() **once** to ask which existing facts the new one supersedes.
-  4. Curate any UUIDs identified as superseded.
+  4. Curate any UUIDs identified as superseded (PATCH state=invalidated
+     + DELETE observations).
 
 Why a single attempt: the webhook fires *after* ``retain.completed``, i.e. the
 server has already committed and indexed the new fact. The old 30s initial
@@ -13,6 +14,13 @@ delay + retry loop existed because hooks fired *before* indexing caught up —
 no longer applicable. If reflect itself fails, callers should treat it as a
 hard failure and re-drive from the webhook later; we surface the error in
 the result.
+
+Note: the pipeline is now driven by the poller, one row at a time, from the
+local ``memory_units`` table. The function therefore takes the
+``(bank_id, unit_id, content)`` triple explicitly instead of an event object,
+and computes ``exclude_unit_ids=[unit_id]`` internally — see commit a4ac52d
+for the original defence against the LLM listing the just-retained fact
+itself in its own supersede list.
 """
 from __future__ import annotations
 
@@ -81,44 +89,38 @@ ConfigLoader = Callable[[str | None], MemorialConfig | None]
 
 
 def run_reconcile(
-    new_fact: str,
+    bank_id: str,
+    unit_id: str,
+    content: str,
     *,
     load_cfg: ConfigLoader,
-    cwd: str | None = None,
     dry_run: bool = False,
-    exclude_unit_ids: list[str] | None = None,
 ) -> ReconcileResult:
-    """Run the shared retain → reconcile pipeline.
+    """Run the shared retain → reconcile pipeline for a single memory unit.
 
-    ``load_cfg`` is a webhook-supplied callable that takes ``cwd`` and
+    The poller drives this function once per pending row in the local
+    ``memory_units`` table. The freshly retained unit's id is
+    automatically excluded from the reflect verdict (see commit
+    a4ac52d — without this, the reflect LLM sometimes lists the new
+    fact itself alongside the ones it supersedes, and memorial would
+    PATCH-invalidate the very fact it just wrote).
+
+    ``load_cfg`` is a webhook/supplied callable that takes ``cwd`` and
     returns a MemorialConfig (or None to mean "no config / skip cleanly").
     The pipeline itself does not care how bank ids are resolved; it only
     takes the resolved MemorialConfig and runs reflect+curate against it.
-
-    ``exclude_unit_ids`` is forwarded to ``extract_superseded_ids`` so the
-    just-retained fact's own id is filtered out of the reflect response —
-    otherwise the reflect LLM sometimes lists the new fact alongside the
-    ones it supersedes and memorial would PATCH-invalidate the very fact
-    it just wrote.
     """
-    if not new_fact or not new_fact.strip():
+    if not content or not content.strip():
         return ReconcileResult(
             status="skipped",
-            reason="no new_fact supplied",
+            reason="no content supplied",
         )
 
-    cfg = load_cfg(cwd)
+    cfg = load_cfg(None)
     if cfg is None:
         return ReconcileResult(
             status="skipped",
             reason="no config loader returned a MemorialConfig",
-        )
-    if not cfg.bank_id:
-        return ReconcileResult(
-            status="skipped",
-            reason=(
-                f"no bank_id resolved (config bank_source={cfg.bank_source})"
-            ),
         )
     if not cfg.api_url:
         return ReconcileResult(
@@ -126,71 +128,98 @@ def run_reconcile(
             reason="no api_url configured",
         )
 
+    # Bank id is the source of truth from the caller; we deliberately
+    # do NOT re-resolve it via cwd (the old behaviour). The
+    # MemorialConfig's bank_id is ignored for routing; we use the
+    # explicit parameter so a misconfigured MemorialConfig can't
+    # accidentally route a unit to the wrong bank.
+    effective_bank_id = bank_id
+    effective_bank_source = "caller"
+
+    if not effective_bank_id:
+        return ReconcileResult(
+            status="skipped",
+            reason="no bank_id supplied",
+        )
+
     try:
-        client = HindsightClient.from_memorial_config(cfg)
+        client = HindsightClient.from_memorial_config(
+            MemorialConfig(
+                api_url=cfg.api_url,
+                api_key=cfg.api_key,
+                bank_id=effective_bank_id,
+                bank_source=effective_bank_source,
+            )
+        )
     except Exception:  # pragma: no cover - depends on env
         # Use log.exception so the full traceback lands in the log file.
-        log.exception("client init failed bank=%s", cfg.bank_id)
+        log.exception("client init failed bank=%s", effective_bank_id)
         return ReconcileResult(status="error", error="client init failed (see logs)")
 
     try:
         bank_ids = client.list_banks()
     except HindsightAPIError as e:
-        log.warning("list_banks failed bank=%s: %s", cfg.bank_id, e)
+        log.warning("list_banks failed bank=%s: %s", effective_bank_id, e)
         return ReconcileResult(
             status="list_banks_failed",
             error=str(e),
-            bank_id=cfg.bank_id,
-            bank_source=cfg.bank_source,
+            bank_id=effective_bank_id,
+            bank_source=effective_bank_source,
         )
 
-    if cfg.bank_id not in bank_ids:
+    if effective_bank_id not in bank_ids:
         log.info(
             "bank '%s' not present on server (resolved via %s, %d available)",
-            cfg.bank_id,
-            cfg.bank_source,
+            effective_bank_id,
+            effective_bank_source,
             len(bank_ids),
         )
         return ReconcileResult(
             status="skipped",
             reason=(
-                f"bank '{cfg.bank_id}' not present on server "
-                f"(resolved via {cfg.bank_source})"
+                f"bank '{effective_bank_id}' not present on server "
+                f"(resolved via {effective_bank_source})"
             ),
-            bank_id=cfg.bank_id,
-            bank_source=cfg.bank_source,
+            bank_id=effective_bank_id,
+            bank_source=effective_bank_source,
             available_bank_count=len(bank_ids),
         )
 
-    query = build_query(new_fact, bank_id=cfg.bank_id)
+    query = build_query(content, bank_id=effective_bank_id)
 
     if dry_run:
         return ReconcileResult(
             status="dry_run",
-            bank_id=cfg.bank_id,
-            bank_source=cfg.bank_source,
-            new_fact_preview=new_fact[:120],
+            bank_id=effective_bank_id,
+            bank_source=effective_bank_source,
+            new_fact_preview=content[:120],
             query_preview=query[:200],
         )
 
     try:
         reflect_resp = client.reflect(
-            cfg.bank_id,
+            effective_bank_id,
             query,
             structured_output=SUPERSEDED_SCHEMA,
-            include_based_on=False,
         )
     except HindsightAPIError as e:
         log.warning("reflect failed: %s", e)
         return ReconcileResult(
             status="reflect_failed",
             error=str(e),
-            bank_id=cfg.bank_id,
-            bank_source=cfg.bank_source,
-            new_fact_preview=new_fact[:120],
+            bank_id=effective_bank_id,
+            bank_source=effective_bank_source,
+            new_fact_preview=content[:120],
         )
 
-    superseded = extract_superseded_ids(reflect_resp, exclude_ids=exclude_unit_ids)
+    # structured_only=True (the default) pins the 2026-08-01 fix for
+    # issue #2: an empty structured list must never fall through to
+    # scanning reasoning prose for UUIDs.
+    superseded = extract_superseded_ids(
+        reflect_resp,
+        exclude_ids=[unit_id] if unit_id else None,
+        structured_only=True,
+    )
 
     # Log what reflect actually said, before acting on it. During the
     # 2026-07-30 incident one reflect call returned 25 ids and every one was
@@ -207,8 +236,9 @@ def run_reconcile(
         if isinstance(raw_ids, list):
             raw_id_count = len(raw_ids)
     log.info(
-        "reflect verdict: bank=%s raw_ids=%d kept_ids=%d ids=%s reasoning=%r",
-        cfg.bank_id,
+        "reflect verdict: bank=%s unit=%s raw_ids=%d kept_ids=%d ids=%s reasoning=%r",
+        effective_bank_id,
+        unit_id,
         raw_id_count,
         len(superseded),
         superseded,
@@ -219,36 +249,42 @@ def run_reconcile(
         return ReconcileResult(
             status="abandoned",
             reason="no superseded facts detected",
-            bank_id=cfg.bank_id,
-            bank_source=cfg.bank_source,
-            new_fact_preview=new_fact[:120],
+            bank_id=effective_bank_id,
+            bank_source=effective_bank_source,
+            new_fact_preview=content[:120],
         )
 
     return _curate_and_return(
         client=client,
-        cfg=cfg,
-        new_fact=new_fact,
+        bank_id=effective_bank_id,
+        content=content,
         superseded=superseded,
+        reasoning=reasoning,
     )
 
 
 def _curate_and_return(
     *,
     client: HindsightClient,
-    cfg: MemorialConfig,
-    new_fact: str,
+    bank_id: str,
+    content: str,
     superseded: list[str],
+    reasoning: str,
 ) -> ReconcileResult:
-    reason = f"Superseded by newly retained fact: {new_fact[:200]}"
-    report: CurateReport = curate_many(
-        client, cfg.bank_id, superseded, reason=reason
-    )
+    """Run Hindsight-side curation, returning a top-level ok/abandoned result.
+
+    The reason string passed to ``invalidate_memory`` is the reflect
+    LLM's reasoning (truncated). The Hindsight side stores this in
+    ``invalidated_memory_units.invalidation_reason`` for audit.
+    """
+    reason = reasoning[:200] if reasoning else f"Superseded by newly retained fact: {content[:200]}"
+    report: CurateReport = curate_many(client, bank_id, superseded, reason=reason)
     return ReconcileResult(
         status="ok",
         superseded_count=len(superseded),
-        bank_id=cfg.bank_id,
-        bank_source=cfg.bank_source,
-        new_fact_preview=new_fact[:120],
+        bank_id=bank_id,
+        bank_source="caller",
+        new_fact_preview=content[:120],
         observations_cleared=report.observations_cleared_count,
         errors=report.error_count,
         results=[asdict(r) for r in report.results],

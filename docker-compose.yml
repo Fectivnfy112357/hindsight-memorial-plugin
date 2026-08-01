@@ -13,6 +13,11 @@
 # Networking: this service joins the existing hindsight_default network so
 # it can resolve the host name "hindsight" and reach the Hindsight API at
 # http://hindsight:8888 (the container-internal port, NOT the 9600 host port).
+#
+# Persistence: the reconciler state lives in the *host's* existing MySQL
+# (decided 2026-08-01), not in a sidecar container. The container reaches it
+# through the `host.docker.internal` → host-gateway mapping below; the host's
+# ufw must allow the hindsight_default subnet (172.23.0.0/16) to reach 3306.
 
 services:
   memorial:
@@ -24,6 +29,9 @@ services:
     container_name: hindsight-memorial
     restart: unless-stopped
     env_file: .env
+    extra_hosts:
+      # Resolves to the docker bridge gateway, i.e. the host running dockerd.
+      - "host.docker.internal:host-gateway"
     environment:
       # Internal address — the host:9600 mapping is only for browsers /
       # external clients; inside the docker network we use the container name.
@@ -31,6 +39,15 @@ services:
       HINDSIGHT_MEMORIAL_LOG_FILE: "/data/logs/hindsight-memorial.log"
       HINDSIGHT_MEMORIAL_LOG_LEVEL: "INFO"
       MEMORIAL_PORT: "9602"
+      # Persistence backend — the host's MySQL. Unset HINDSIGHT_MYSQL_HOST
+      # to fall back to the SQLite "ingest-only" mode.
+      HINDSIGHT_MYSQL_HOST: "${HINDSIGHT_MYSQL_HOST:-host.docker.internal}"
+      HINDSIGHT_MYSQL_PORT: "${HINDSIGHT_MYSQL_PORT:-3306}"
+      HINDSIGHT_MYSQL_USER: "${HINDSIGHT_MYSQL_USER:-memorial}"
+      HINDSIGHT_MYSQL_PASSWORD: "${HINDSIGHT_MYSQL_PASSWORD:?must set in .env}"
+      HINDSIGHT_MYSQL_DATABASE: "${HINDSIGHT_MYSQL_DATABASE:-hindsight_memorial}"
+      HINDSIGHT_POLLER_ENABLED: "1"
+      HINDSIGHT_POLLER_INTERVAL_SEC: "1"
     volumes:
       # Logs — bind-mounted so they survive container rebuilds.
       - ./data/logs:/data/logs

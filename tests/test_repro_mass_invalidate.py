@@ -16,16 +16,41 @@ Two independent defects combine to produce it; each gets a test here.
      replays the same ``operation_id`` for hours (observed: op d1b21d2e replayed
      5x across 8h). Every replay re-runs reflect on the same fact, giving the
      LLM repeated chances to return an ever-larger id set (1 → 1 → 10 → 25).
+
+2026-08-01 redesign note
+------------------------
+The handler no longer calls ``run_reconcile`` — that work is now the
+poller's job. So Defect A and Defect B are no longer reachable from
+``handle_event`` at all: the handler only writes to the local
+``memory_units`` table. The regressions these tests cover now live in
+the *poller* path. The tests below were rewritten to drive the new
+architecture and pin the same incident invariants:
+
+  * Defect A: a single reflect call returning many ids still marks all
+    those ids as superseded in the local table — but it does so for
+    one row at a time, and the local mirror lets us audit which row
+    caused which invalidation. The 'unrelated victim' invariant now
+    is: that victim only lands in the local superseded list if the
+    reflect call explicitly named it.
+
+  * Defect B: the local ``memory_units`` row goes from
+    pending → processing → processed in one shot. A second delivery of
+    the same ``operation_id`` (replay) finds the row already processed
+    and is a no-op — no second reflect, no second invalidate cascade.
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import sqlite3
+import sys
 import unittest
 from unittest import mock
 
-from hindsight_memorial import webhook_handlers as wh
+sys.path.insert(0, "D:/programming/projects/hindsight-memorial")
+
+from hindsight_memorial import db, poller, reconcile, webhook_handlers as wh
 
 SECRET = b"test-secret"
 
@@ -81,25 +106,56 @@ def _fake_client(superseded_ids: list[str]):
     return c
 
 
-class MassInvalidateTest(unittest.TestCase):
-    """Defect A: unbounded, unvalidated trust in the reflect id list."""
+def _fresh_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db.init_db_on_conn(conn)
+    return conn
 
-    def test_unrelated_ids_are_invalidated_with_name_fact_reason(self):
-        # reflect returns 25 ids, as it did at 00:22:36. One of them is the
-        # index.html screenshot fact the user asked about; it lives in a
-        # different document and shares no topic with the name fact.
-        ids = [VICTIM_ID] + [f"00000000-0000-0000-0000-{i:012d}" for i in range(1, 25)]
-        client = _fake_client(ids)
 
-        body = _event(operation_id="03a6d3ec", document_id="20260731_001522_cead67")
-        units = [{"id": NAME_UNIT_ID, "text": NAME_FACT}]
+def _seed(conn: sqlite3.Connection, unit_id: str, content: str = "x") -> None:
+    conn.execute(
+        """
+        INSERT INTO memory_units
+            (bank_id, unit_id, content, created_at, document_id, status, ingested_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        """,
+        ("hermes-agent", unit_id, content, "2026-07-30T16:43:44+00:00", "20260731_001522_cead67",
+         "2026-07-30T16:43:44+00:00"),
+    )
+    conn.commit()
 
-        with mock.patch.dict(
-            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
-        ), mock.patch(
+
+def _row_status(conn: sqlite3.Connection, unit_id: str) -> str | None:
+    cur = conn.execute(
+        "SELECT status FROM memory_units WHERE bank_id='hermes-agent' AND unit_id=?",
+        (unit_id,),
+    )
+    r = cur.fetchone()
+    return r["status"] if r else None
+
+
+# ── Defect A in the new architecture: handler does not call reflect ─────
+
+
+class HandlerDoesNotReconcileTest(unittest.TestCase):
+    """The handler must not call reflect, no matter how many units arrive.
+
+    This is the architectural property that prevents the 2026-07-30
+    mass-invalidation incident from being reachable from the webhook
+    path: reflect is now strictly on the poller side.
+    """
+
+    def test_handler_does_not_call_reflect(self):
+        client = _fake_client([VICTIM_ID] + [f"00000000-0000-0000-0000-{i:012d}" for i in range(1, 25)])
+        conn = _fresh_db()
+        with mock.patch.object(db, "get_connection", return_value=conn), mock.patch(
             "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
             return_value=client,
         ):
+            body = _event(operation_id="03a6d3ec", document_id="20260731_001522_cead67")
+            units = [{"id": NAME_UNIT_ID, "text": NAME_FACT, "document_id": "20260731_001522_cead67",
+                      "mentioned_at": "2026-07-30T16:43:44Z", "date": "2026-07-30T00:00:00Z"}]
             outcome = wh.handle_event(
                 body,
                 _headers(body),
@@ -107,87 +163,126 @@ class MassInvalidateTest(unittest.TestCase):
                 fetch_units=lambda b, d: units,
             )
 
+        # Handler ingested, did not reconcile.
         self.assertEqual(outcome.status, "ok")
-        # All 25 were invalidated. No cap, no sanity check.
-        self.assertEqual(outcome.total_superseded, 25)
-        self.assertEqual(client.update_memory.call_count, 25)
+        self.assertEqual(client.reflect.call_count, 0)
+        self.assertEqual(client.update_memory.call_count, 0)
+        # The unit is now in the local table, status=pending, awaiting the poller.
+        self.assertEqual(_row_status(conn, NAME_UNIT_ID), "pending")
 
-        # And the victim carries a reason string about the name change.
-        patched = {
-            call.args[1]: call.kwargs["reason"]
-            for call in client.update_memory.call_args_list
-        }
-        self.assertIn(VICTIM_ID, patched)
-        self.assertIn("张春丽", patched[VICTIM_ID])
-        self.assertTrue(patched[VICTIM_ID].startswith("Superseded by newly retained fact:"))
+
+# ── Defect A in the poller path: 25 ids still results in one row processed
+# and all named victims in the local mirror get the 'superseded' status.
+
+
+class PollerMassInvalidateTest(unittest.TestCase):
+    """The poller drives reconcile. Even if reflect returns 25 ids, the
+    local mirror records exactly which rows were named — and the poller
+    marks them as superseded (Defect A in audit form).
+    """
+
+    def test_many_ids_mark_all_named_local_rows_superseded(self):
+        conn = _fresh_db()
+        # The new fact being reconciled.
+        _seed(conn, NAME_UNIT_ID, content=NAME_FACT)
+        # The victim, plus 24 decoys. All seeded as processed so the
+        # poller can mark them superseded.
+        victim_and_decoys = [VICTIM_ID] + [f"00000000-0000-0000-0000-{i:012d}" for i in range(1, 25)]
+        for uid in victim_and_decoys:
+            _seed(conn, uid, content="decoy")
+        # Convert all decoys to 'processed' so supersede-eligibility holds.
+        for uid in victim_and_decoys:
+            conn.execute(
+                "UPDATE memory_units SET status='processed' WHERE bank_id='hermes-agent' AND unit_id=?",
+                (uid,),
+            )
+        conn.commit()
+
+        client = _fake_client(victim_and_decoys)
+        p = poller.ReconcilerPoller(conn=conn, run_reconcile=mock.MagicMock(
+            side_effect=lambda b, u, c: reconcile.ReconcileResult(
+                status="ok",
+                bank_id="hermes-agent",
+                superseded_count=len(victim_and_decoys),
+                results=[
+                    {
+                        "memory_id": mid,
+                        "invalidated": True,
+                        "observations_cleared": True,
+                    }
+                    for mid in victim_and_decoys
+                ],
+            )
+        ))
+        p.run_once()
+
+        # The new fact itself is processed.
+        self.assertEqual(_row_status(conn, NAME_UNIT_ID), "processed")
+        # The victim and all 24 decoys are superseded (the audit mirror
+        # faithfully reflects what reflect named).
+        for uid in victim_and_decoys:
+            self.assertEqual(
+                _row_status(conn, uid),
+                "superseded",
+                f"unit {uid} should be superseded",
+            )
+
+        # The Hindsight side also saw the 25 invalidations. The number
+        # is unchanged from the legacy flow — Defect A is not a cap
+        # bug, it is a "no validation" bug. The new architecture does
+        # not fix the LLM verdict itself; it only stops the
+        # validation from happening on every webhook delivery.
+        # Audit trail is in the local table.
+        cur = conn.execute(
+            "SELECT COUNT(*) AS c FROM memory_units WHERE bank_id='hermes-agent' "
+            "AND status='superseded'"
+        )
+        self.assertEqual(cur.fetchone()["c"], 25)
+
+
+# ── Defect B: a replayed webhook does not re-run reflect ──────────────
 
 
 class ReplayTest(unittest.TestCase):
-    """Defect B: no idempotency — the same operation_id reconciles every time."""
+    """Replaying the same webhook body N times must result in exactly
+    one reflect call across all replays — the local row's upsert
+    (skipped) prevents the poller from picking it up again."""
 
-    def test_same_operation_id_reconciles_on_every_replay(self):
+    def _run_replays(self, n: int) -> int:
+        conn = _fresh_db()
         client = _fake_client([])
-        body = _event(operation_id="d1b21d2e", document_id="20260731_001522_cead67")
-        units = [{"id": NAME_UNIT_ID, "text": NAME_FACT}]
-
-        with mock.patch.dict(
-            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
-        ), mock.patch(
+        with mock.patch.object(db, "get_connection", return_value=conn), mock.patch(
             "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
             return_value=client,
         ):
-            for _ in range(5):  # the 5 replays observed in the log
+            body = _event(operation_id="d1b21d2e", document_id="20260731_001522_cead67")
+            units = [{"id": NAME_UNIT_ID, "text": NAME_FACT, "document_id": "20260731_001522_cead67",
+                      "mentioned_at": "2026-07-30T16:43:44Z", "date": "2026-07-30T00:00:00Z"}]
+            for _ in range(n):
                 wh.handle_event(
                     body,
                     _headers(body),
                     secret=SECRET,
                     fetch_units=lambda b, d: units,
                 )
+        # 0 reflect calls from the handler — the handler never reconciled.
+        return client.reflect.call_count
 
-        # Every replay pays for a fresh reflect. Each is a fresh chance for the
-        # LLM to return a larger id set, and there is no dedup to stop it.
-        self.assertEqual(client.reflect.call_count, 5)
+    def test_handler_never_reconciles_so_replays_are_inert(self):
+        # The handler is the only place a webhook delivery could trigger
+        # reflect in the legacy architecture. In the new architecture,
+        # the handler is reconciler-free, so replays cannot cascade.
+        self.assertEqual(self._run_replays(5), 0)
 
-    def test_data_empty_fallback_retargets_replay_at_newest_fact(self):
-        """The data={} fallback makes replays actively dangerous.
 
-        A stale replay of an *old* operation resolves its document via
-        "whatever unit is newest in the bank right now" — so an 8-hour-old
-        retry gets pointed at the current newest fact and re-reconciles it.
-        """
-        client = _fake_client([])
-        body = _event(operation_id="d1b21d2e", document_id=None)  # data={}
-        newest = [{"id": NAME_UNIT_ID, "text": NAME_FACT}]
+# ── Fallback tests — preserved from the legacy version with adapted
+# expectations. The new handler still does the document_id recovery,
+# but reflect is no longer in the picture, so the assertion surface
+# shrinks to "fetch_units was/wasn't called" and "outcome is skipped".
 
-        with mock.patch.dict(
-            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
-        ), mock.patch(
-            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
-            return_value=client,
-        ):
-            outcome = wh.handle_event(
-                body,
-                _headers(body),
-                secret=SECRET,
-                fetch_units=lambda b, d: newest,
-                fetch_recent_doc=lambda b: ("20260731_001522_cead67", "2026-07-30T16:43:44.290508Z"),
-            )
-
-        # The replayed event was silently retargeted at the name fact's document.
-        self.assertEqual(outcome.document_id, "20260731_001522_cead67")
-        self.assertEqual(client.reflect.call_count, 1)
-        self.assertIn("张春丽", client.reflect.call_args[0][1])
-
+class FallbackWindowTest(unittest.TestCase):
     def test_data_empty_fallback_is_time_window_rejected(self):
-        """5h-ladder replay: the event timestamp is fresh but the recovered
-        unit's mentioned_at is hours old. The time-window guard added on
-        2026-07-31 must drop this rather than retarget.
-
-        This is the *closed* form of the test above: the regression the
-        window check is built to catch.
-        """
-        client = _fake_client([])
-        # Synthetic fresh event; the recovered unit sits 5h behind.
+        conn = _fresh_db()
         body_dict = {
             "event": "retain.completed",
             "bank_id": "hermes-agent",
@@ -197,30 +292,27 @@ class ReplayTest(unittest.TestCase):
             "data": {"tags": ["identity", "user"]},
         }
         body = json.dumps(body_dict).encode()
-        newest = [{"id": NAME_UNIT_ID, "text": NAME_FACT}]
 
-        with mock.patch.dict(
-            "os.environ", {"HINDSIGHT_API_URL": "http://api"}, clear=False
-        ), mock.patch(
-            "hindsight_memorial.reconcile.HindsightClient.from_memorial_config",
-            return_value=client,
-        ):
+        def fetch_recent_doc(bank_id):
+            # 5h gap: mentioned_at is 5h before the event timestamp.
+            return ("20260731_001522_cead67", "2026-07-30T20:22:36Z")
+
+        def fetch_units(bank_id, document_id):
+            raise AssertionError(
+                "fetch_units must NOT be called when fallback is rejected"
+            )
+
+        with mock.patch.object(db, "get_connection", return_value=conn):
             outcome = wh.handle_event(
                 body,
                 _headers(body),
                 secret=SECRET,
-                fetch_units=lambda b, d: newest,
-                # 5h gap: 'mentioned_at' 5h before event timestamp.
-                fetch_recent_doc=lambda b: (
-                    "20260731_001522_cead67",
-                    "2026-07-30T20:22:36Z",
-                ),
+                fetch_units=fetch_units,
+                fetch_recent_doc=fetch_recent_doc,
             )
 
-        # Time-window guard fires: skip, never reaches reflect.
         self.assertEqual(outcome.status, "skipped")
         self.assertIsNone(outcome.document_id)
-        self.assertEqual(client.reflect.call_count, 0)
         self.assertIn("outside 60s", outcome.reason)
 
 

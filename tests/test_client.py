@@ -79,6 +79,40 @@ class ErrorPathTest(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 0)
         self.assertIn("connection refused", ctx.exception.body)
 
+    def test_timeout_error_is_wrapped_as_typed_exception(self):
+        """Python 3.10+ raises a built-in ``TimeoutError`` (an OSError
+        subclass) for ``urlopen(timeout=...)``. The 2026-07-31 incident
+        log showed this path was unhandled, leaking a raw
+        ``TimeoutError`` that the reconciler had to catch ad-hoc.
+        This test pins the contract: every urlopen failure must surface
+        as a ``HindsightAPIError``, regardless of the underlying
+        exception class."""
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            raise TimeoutError("timed out")
+
+        with mock.patch.object(client_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(HindsightAPIError) as ctx:
+                HindsightClient(base_url="http://t").reflect("b1", "q")
+        self.assertEqual(ctx.exception.status, 0)
+        self.assertIn("timed out", ctx.exception.body)
+        # The cause chain is preserved for debugging.
+        self.assertIsInstance(ctx.exception.__cause__, TimeoutError)
+
+    def test_connection_reset_error_is_wrapped_as_typed_exception(self):
+        """ConnectionResetError is an OSError subclass but not an
+        URLError — it used to slip through the old two-exception
+        catch. Pin the contract here too."""
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            raise ConnectionResetError("connection reset by peer")
+
+        with mock.patch.object(client_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(HindsightAPIError) as ctx:
+                HindsightClient(base_url="http://t").reflect("b1", "q")
+        self.assertEqual(ctx.exception.status, 0)
+        self.assertIn("connection reset", ctx.exception.body)
+
 
 class ResponseParseTest(unittest.TestCase):
     def test_empty_body_returns_empty_dict(self):

@@ -5,10 +5,14 @@ DELETE observations on each one. Failures are isolated per-id so one bad id does
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import db
 from .client import HindsightAPIError, HindsightClient
+
+log = logging.getLogger("hindsight_memorial.curate")
 
 
 @dataclass(frozen=True)
@@ -113,3 +117,43 @@ def curate_many(
     for mid in memory_ids:
         report.results.append(curate_memory(client, bank_id, mid, reason=reason))
     return report
+
+
+def curate_superseded_in_db(
+    conn,
+    bank_id: str,
+    unit_ids: list[str],
+    *,
+    reason: str,
+) -> int:
+    """Soft-mark local ``memory_units`` rows whose ids appear in
+    ``unit_ids`` as superseded.
+
+    This is the local-table mirror of :func:`curate_many`. After the
+    Hindsight side has invalidated the matching facts there, the local
+    rows that referenced those ids are flipped to ``status='superseded'``
+    with the reflect reasoning (or a short summary) recorded in
+    ``superseded_reason``.
+
+    Eligibility (``status IN ('pending','processed')``) deliberately
+    excludes 'processing' so we never overwrite the very row currently
+    being reconciled. The poller calls this *after* marking its row
+    'processing', so its own id is in 'processing' and is therefore safe
+    even if it appears in the supersede list by accident (defence in
+    depth on top of the ``exclude_ids`` filter in reflect).
+
+    Returns the number of local rows actually flipped, mainly for
+    logging.
+    """
+    if not unit_ids:
+        return 0
+    return db.mark_superseded_on_conn(conn, bank_id, unit_ids, reason=reason)
+
+
+__all__ = [
+    "CurateReport",
+    "CurateResult",
+    "curate_many",
+    "curate_memory",
+    "curate_superseded_in_db",
+]
