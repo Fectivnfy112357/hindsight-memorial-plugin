@@ -15,7 +15,7 @@ from typing import Any
 
 from .config import MemorialConfig
 
-DEFAULT_TIMEOUT = 180.0
+DEFAULT_TIMEOUT = 560.0
 
 
 class HindsightAPIError(RuntimeError):
